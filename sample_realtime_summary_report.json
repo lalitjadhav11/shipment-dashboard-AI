@@ -1,0 +1,386 @@
+{
+  "generated_at": "2026-07-17T19:22:31.342299+00:00",
+  "headline": {
+    "total_shipments": 25000,
+    "total_customers": 800,
+    "delivered_count": 14000,
+    "on_time_pct": 75.0,
+    "in_transit_overdue": 6550,
+    "open_issues": 2185,
+    "international_shipments": 5704,
+    "customs_held_now": 600,
+    "lost_count": 100,
+    "returned_count": 200,
+    "cancelled_count": 200,
+    "generated_at": "2026-07-17T19:22:31.342390+00:00"
+  },
+  "status_breakdown": [
+    {
+      "current_status": "DELIVERED",
+      "shipment_count": 14000,
+      "pct_of_total": 56.0
+    },
+    {
+      "current_status": "IN_TRANSIT",
+      "shipment_count": 3250,
+      "pct_of_total": 13.0
+    },
+    {
+      "current_status": "AT_DISTRIBUTION_HUB",
+      "shipment_count": 1000,
+      "pct_of_total": 4.0
+    },
+    {
+      "current_status": "IN_TRANSIT_TO_DESTINATION_HUB",
+      "shipment_count": 1000,
+      "pct_of_total": 4.0
+    },
+    {
+      "current_status": "AT_CONNECTING_HUB",
+      "shipment_count": 800,
+      "pct_of_total": 3.2
+    },
+    {
+      "current_status": "IN_TRANSIT_TO_ORIGIN_HUB",
+      "shipment_count": 800,
+      "pct_of_total": 3.2
+    },
+    {
+      "current_status": "OUT_FOR_DELIVERY",
+      "shipment_count": 750,
+      "pct_of_total": 3.0
+    },
+    {
+      "current_status": "CUSTOMS_HOLD",
+      "shipment_count": 600,
+      "pct_of_total": 2.4
+    },
+    {
+      "current_status": "CUSTOMS_CLEARED",
+      "shipment_count": 500,
+      "pct_of_total": 2.0
+    },
+    {
+      "current_status": "TRACKING_ID_ISSUED",
+      "shipment_count": 400,
+      "pct_of_total": 1.6
+    },
+    {
+      "current_status": "PACKAGE_RECEIVED",
+      "shipment_count": 400,
+      "pct_of_total": 1.6
+    },
+    {
+      "current_status": "DELIVERY_FAILED",
+      "shipment_count": 400,
+      "pct_of_total": 1.6
+    },
+    {
+      "current_status": "SHIPMENT_CREATED",
+      "shipment_count": 300,
+      "pct_of_total": 1.2
+    },
+    {
+      "current_status": "LABEL_CREATED",
+      "shipment_count": 300,
+      "pct_of_total": 1.2
+    },
+    {
+      "current_status": "CANCELLED",
+      "shipment_count": 200,
+      "pct_of_total": 0.8
+    },
+    {
+      "current_status": "RETURNED_TO_SENDER",
+      "shipment_count": 200,
+      "pct_of_total": 0.8
+    },
+    {
+      "current_status": "LOST",
+      "shipment_count": 100,
+      "pct_of_total": 0.4
+    }
+  ],
+  "ontime_performance": {
+    "delivered_count": 14000,
+    "delivered_on_time": 10500,
+    "delivered_late": 3500,
+    "on_time_pct": 75.0,
+    "avg_delay_hours_when_late": 51.8,
+    "in_transit_overdue": 6550
+  },
+  "delay_reason_breakdown": [
+    {
+      "reason_for_delay": "ADDRESS_ISSUE",
+      "shipment_count": 1159,
+      "pct_of_delayed": 19.69
+    },
+    {
+      "reason_for_delay": "OTHER",
+      "shipment_count": 1105,
+      "pct_of_delayed": 18.78
+    },
+    {
+      "reason_for_delay": "CUSTOMS",
+      "shipment_count": 958,
+      "pct_of_delayed": 16.28
+    },
+    {
+      "reason_for_delay": "WEATHER",
+      "shipment_count": 873,
+      "pct_of_delayed": 14.83
+    },
+    {
+      "reason_for_delay": "CIVIL_UNREST",
+      "shipment_count": 854,
+      "pct_of_delayed": 14.51
+    },
+    {
+      "reason_for_delay": "MECHANICAL_ISSUE",
+      "shipment_count": 836,
+      "pct_of_delayed": 14.21
+    },
+    {
+      "reason_for_delay": "LOST_PACKAGE",
+      "shipment_count": 100,
+      "pct_of_delayed": 1.7
+    }
+  ],
+  "open_issues_summary": [
+    {
+      "issue_type": "CUSTOMS_HOLD",
+      "status": "OPEN",
+      "issue_count": 326,
+      "avg_age_or_resolution_hours": 352.7
+    },
+    {
+      "issue_type": "OTHER",
+      "status": "OPEN",
+      "issue_count": 210,
+      "avg_age_or_resolution_hours": 344.3
+    },
+    {
+      "issue_type": "WEATHER_DELAY",
+      "status": "OPEN",
+      "issue_count": 109,
+      "avg_age_or_resolution_hours": 353.0
+    },
+    {
+      "issue_type": "ADDRESS_ISSUE",
+      "status": "OPEN",
+      "issue_count": 94,
+      "avg_age_or_resolution_hours": 361.8
+    },
+    {
+      "issue_type": "CIVIL_UNREST",
+      "status": "OPEN",
+      "issue_count": 85,
+      "avg_age_or_resolution_hours": 336.3
+    },
+    {
+      "issue_type": "LOST_PACKAGE",
+      "status": "OPEN",
+      "issue_count": 54,
+      "avg_age_or_resolution_hours": 321.2
+    },
+    {
+      "issue_type": "OTHER",
+      "status": "RESOLVED",
+      "issue_count": 1264,
+      "avg_age_or_resolution_hours": 162.2
+    },
+    {
+      "issue_type": "CIVIL_UNREST",
+      "status": "RESOLVED",
+      "issue_count": 659,
+      "avg_age_or_resolution_hours": 164.0
+    },
+    {
+      "issue_type": "WEATHER_DELAY",
+      "status": "RESOLVED",
+      "issue_count": 654,
+      "avg_age_or_resolution_hours": 165.8
+    },
+    {
+      "issue_type": "ADDRESS_ISSUE",
+      "status": "RESOLVED",
+      "issue_count": 619,
+      "avg_age_or_resolution_hours": 160.5
+    },
+    {
+      "issue_type": "FAILED_DELIVERY_ATTEMPT",
+      "status": "INVESTIGATING",
+      "issue_count": 400,
+      "avg_age_or_resolution_hours": 342.2
+    },
+    {
+      "issue_type": "CUSTOMS_HOLD",
+      "status": "INVESTIGATING",
+      "issue_count": 328,
+      "avg_age_or_resolution_hours": 361.5
+    },
+    {
+      "issue_type": "CUSTOMS_HOLD",
+      "status": "RESOLVED",
+      "issue_count": 304,
+      "avg_age_or_resolution_hours": 176.2
+    },
+    {
+      "issue_type": "OTHER",
+      "status": "INVESTIGATING",
+      "issue_count": 209,
+      "avg_age_or_resolution_hours": 346.5
+    },
+    {
+      "issue_type": "FAILED_DELIVERY_ATTEMPT",
+      "status": "CLOSED",
+      "issue_count": 200,
+      "avg_age_or_resolution_hours": 171.5
+    },
+    {
+      "issue_type": "WEATHER_DELAY",
+      "status": "INVESTIGATING",
+      "issue_count": 110,
+      "avg_age_or_resolution_hours": 287.5
+    },
+    {
+      "issue_type": "CIVIL_UNREST",
+      "status": "INVESTIGATING",
+      "issue_count": 110,
+      "avg_age_or_resolution_hours": 358.3
+    },
+    {
+      "issue_type": "ADDRESS_ISSUE",
+      "status": "INVESTIGATING",
+      "issue_count": 104,
+      "avg_age_or_resolution_hours": 333.5
+    },
+    {
+      "issue_type": "LOST_PACKAGE",
+      "status": "INVESTIGATING",
+      "issue_count": 46,
+      "avg_age_or_resolution_hours": 363.3
+    }
+  ],
+  "domestic_vs_international": [
+    {
+      "shipment_scope": "INTERNATIONAL",
+      "shipment_count": 5704,
+      "customs_held": 510,
+      "customs_pending": 1208,
+      "customs_cleared": 3868
+    },
+    {
+      "shipment_scope": "DOMESTIC",
+      "shipment_count": 19296,
+      "customs_held": 0,
+      "customs_pending": 0,
+      "customs_cleared": 0
+    }
+  ],
+  "service_level_mix": [
+    {
+      "delivery_type": "STANDARD",
+      "shipment_count": 10046,
+      "on_time_pct": 74.53
+    },
+    {
+      "delivery_type": "EXPRESS",
+      "shipment_count": 6294,
+      "on_time_pct": 75.0
+    },
+    {
+      "delivery_type": "INTERNATIONAL_PRIORITY",
+      "shipment_count": 3877,
+      "on_time_pct": 75.21
+    },
+    {
+      "delivery_type": "ECONOMY",
+      "shipment_count": 2895,
+      "on_time_pct": 75.41
+    },
+    {
+      "delivery_type": "OVERNIGHT",
+      "shipment_count": 1888,
+      "on_time_pct": 76.43
+    }
+  ],
+  "top_10_customers": [
+    {
+      "org_name": "Leon-Miller",
+      "fedex_account_id": "ACCT-100656",
+      "shipment_count": 53,
+      "delivered_count": 31,
+      "on_time_pct": 70.97
+    },
+    {
+      "org_name": "Bass Inc",
+      "fedex_account_id": "ACCT-100438",
+      "shipment_count": 49,
+      "delivered_count": 23,
+      "on_time_pct": 82.61
+    },
+    {
+      "org_name": "Fry, Hobbs and Buck",
+      "fedex_account_id": "ACCT-100084",
+      "shipment_count": 48,
+      "delivered_count": 29,
+      "on_time_pct": 65.52
+    },
+    {
+      "org_name": "Flores-Francis",
+      "fedex_account_id": "ACCT-100663",
+      "shipment_count": 47,
+      "delivered_count": 26,
+      "on_time_pct": 65.38
+    },
+    {
+      "org_name": "Burnett Inc",
+      "fedex_account_id": "ACCT-100667",
+      "shipment_count": 47,
+      "delivered_count": 21,
+      "on_time_pct": 76.19
+    },
+    {
+      "org_name": "Campbell LLC",
+      "fedex_account_id": "ACCT-100034",
+      "shipment_count": 46,
+      "delivered_count": 27,
+      "on_time_pct": 62.96
+    },
+    {
+      "org_name": "Fuller-Collins",
+      "fedex_account_id": "ACCT-100719",
+      "shipment_count": 46,
+      "delivered_count": 26,
+      "on_time_pct": 73.08
+    },
+    {
+      "org_name": "Todd-Haynes",
+      "fedex_account_id": "ACCT-100774",
+      "shipment_count": 45,
+      "delivered_count": 23,
+      "on_time_pct": 65.22
+    },
+    {
+      "org_name": "White Ltd",
+      "fedex_account_id": "ACCT-100794",
+      "shipment_count": 45,
+      "delivered_count": 22,
+      "on_time_pct": 63.64
+    },
+    {
+      "org_name": "Robinson Ltd",
+      "fedex_account_id": "ACCT-100208",
+      "shipment_count": 45,
+      "delivered_count": 26,
+      "on_time_pct": 73.08
+    }
+  ],
+  "chat_activity": {
+    "total_chat_interactions": 2993,
+    "shipments_with_chat": 2020,
+    "avg_confidence": 0.9087,
+    "low_confidence_needing_review": 0
+  }
+}
