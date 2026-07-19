@@ -2,9 +2,16 @@
 Orchestrates Stages 1-7 as a plain sequential generator — not a
 LangChain/LangGraph agent (see AGENTIC_RAG_ARCHITECTURE.md §6: "the control
 flow is fixed, so a graph/agent framework would add indirection without
-adding capability at this scale"). v0 only: Stage 4b and the LLM half of
-Stage 7 don't exist yet, so unmatched/low-confidence queries get a static
-clarifying response instead of an LLM fallback.
+adding capability at this scale").
+
+v1: Stage 4a (templates) is always tried first, for every query — Stage 4b
+(LLM SQL draft) only runs when Stage 4a produces nothing, whether because no
+intent matched or a matched intent's required entity was missing. Stage 7 is
+then routed by which stage produced the SQL: Stage 4a's output always goes
+to the zero-cost v0 template formatter; only Stage 4b's output reaches the
+v1 LLM synthesizer. Without an ANTHROPIC_API_KEY configured, sql_llm.draft_sql
+returns None immediately and behavior degrades to v0's clarifying answer —
+see AGENTIC_RAG_ARCHITECTURE.md §2/§4 for the full routing rationale.
 
 Yields one {"stage": ..., "detail": ...} trace event per pipeline step,
 ending with a final "answer_ready" event. router.py decides whether to
@@ -16,9 +23,11 @@ from . import intent as intent_stage
 from . import entities as entity_stage
 from . import schema_scope
 from . import sql_templates
+from . import sql_llm
 from . import guardrails
 from . import executor
 from . import respond_template
+from . import synthesize
 from .audit import log_chat_interaction
 
 CLARIFYING_ANSWER = {
@@ -37,6 +46,34 @@ REJECTED_ANSWER = {
     "confidence_score": 0.0,
     "supporting_data": {},
 }
+
+EXECUTION_FAILED_ANSWER = {
+    "answer": "That query took too long to run (or hit a database error), so I wasn't able to get an answer. Try narrowing your question.",
+    "confidence_score": 0.0,
+    "supporting_data": {},
+}
+
+# Only tracking_id has a blind-default/override shortcut below — org_name and
+# location never had an equivalent, so an unmatched query mentioning either
+# already falls straight through to Stage 4b today; nothing to fix there.
+MINIMAL_QUERY_MAX_WORDS = 4
+
+
+def _is_minimal_query(query: str, tracking_ids: list) -> bool:
+    """True for a genuinely bare query — just a tracking number, or barely
+    more ("wheres X") — where defaulting to a general status lookup is a
+    safe, useful guess. False for a longer, clearly-articulated question
+    that happens to mention a tracking_id but is asking something more
+    specific ("what was the previous stage of X") — forcing THAT into a
+    fixed-shape template answers the wrong question confidently instead of
+    honestly, which is worse than trying Stage 4b or declining. Tuned so the
+    already-verified corner-case-audit regressions ("tell me about shipment
+    X" -> 4 words, "give me details about X" -> 4 words) still take the
+    default, while "what was the previous stage of X" (6 words) doesn't."""
+    stripped = query
+    for tid in tracking_ids:
+        stripped = stripped.replace(tid, " ")
+    return len(stripped.split()) <= MINIMAL_QUERY_MAX_WORDS
 
 
 def _multi_id_answer(tracking_ids: list) -> dict:
@@ -101,10 +138,11 @@ def run_pipeline(query: str):
         yield from _finish(query, extracted, None, _multi_id_answer(extracted.tracking_ids), [])
         return
 
-    scoped = schema_scope.scope_schema(query)
+    scoped = schema_scope.scope_schema(query, extracted)
     yield {"stage": "schema_scoped", "detail": {
         "entities": scoped.entities,
         "scores": {k: round(v, 3) for k, v in scoped.scores.items()},
+        "forced_entities": scoped.forced_entities,
     }}
 
     resolved_intent = intent_result.intent
@@ -117,53 +155,93 @@ def run_pipeline(query: str):
     # contain a 9-15 digit number. A "not found" answer from the wrong
     # template is a far more honest failure than a confidently irrelevant
     # fleet-wide report — see AGENTIC_RAG_ARCHITECTURE.md's corner-case audit.
+    #
+    # But only default to where_is_my_package for a genuinely minimal query.
+    # A longer, specific question ("what's the average delay excluding
+    # 800000000131") shouldn't be force-answered as a single-shipment status
+    # lookup either — clear the match entirely and let Stage 4b (which
+    # already gets the right raw entity scoped in via Stage 3's identity
+    # forcing) decide what the question actually needs.
     template_spec = sql_templates.TEMPLATES.get(resolved_intent) if resolved_intent else None
     if (template_spec is not None and extracted.tracking_id
             and "tracking_id" not in template_spec.required):
-        yield {"stage": "intent_overridden", "detail": {
-            "reason": "classifier matched a fleet-wide intent despite a tracking_id "
-                      "being present in the query — overriding to a shipment-scoped lookup",
-            "original_intent": resolved_intent,
-            "overridden_to": "where_is_my_package",
-        }}
-        resolved_intent = "where_is_my_package"
+        if _is_minimal_query(query, extracted.tracking_ids):
+            yield {"stage": "intent_overridden", "detail": {
+                "reason": "classifier matched a fleet-wide intent despite a tracking_id "
+                          "being present in the query — overriding to a shipment-scoped lookup",
+                "original_intent": resolved_intent,
+                "overridden_to": "where_is_my_package",
+            }}
+            resolved_intent = "where_is_my_package"
+        else:
+            yield {"stage": "intent_overridden", "detail": {
+                "reason": "classifier matched a fleet-wide intent despite a tracking_id "
+                          "being present, and the query is too specific to safely default to "
+                          "a shipment-scoped lookup either — clearing the match for Stage 4b",
+                "original_intent": resolved_intent,
+                "overridden_to": None,
+            }}
+            resolved_intent = None
 
     if resolved_intent is None and extracted.tracking_id:
-        # Below-threshold confidence, but exactly one tracking_id was found —
-        # default to the general status lookup rather than declining outright.
-        # This is a deliberate fallback, not a real classification, so it's
-        # flagged in the trace for verbose/privileged viewers to distinguish
-        # from an actual confident match.
-        resolved_intent = "where_is_my_package"
-        yield {"stage": "intent_defaulted", "detail": {
-            "reason": "confidence below threshold but a tracking_id was found — "
-                      "defaulting to a general status lookup instead of declining",
-            "intent": resolved_intent,
-        }}
+        if _is_minimal_query(query, extracted.tracking_ids):
+            # Genuinely bare query ("800000000131", "wheres X") — default to
+            # the general status lookup rather than declining outright. This
+            # is a deliberate fallback, not a real classification, so it's
+            # flagged in the trace for verbose/privileged viewers to
+            # distinguish it from an actual confident match.
+            resolved_intent = "where_is_my_package"
+            yield {"stage": "intent_defaulted", "detail": {
+                "reason": "confidence below threshold but a tracking_id was found, and "
+                          "the query is minimal enough that a general status lookup is a "
+                          "safe guess",
+                "intent": resolved_intent,
+            }}
+        else:
+            # A real, specific question that just didn't match any known
+            # template — forcing it into where_is_my_package would answer
+            # confidently but wrong (e.g. "what was the previous stage of
+            # X" got told the *current* status). Leave resolved_intent as
+            # None so it falls through to the Stage 4b attempt below
+            # instead of a mismatched canned answer.
+            yield {"stage": "default_skipped_too_specific", "detail": {
+                "reason": "tracking_id found but the query is too specific for a blind "
+                          "'where is it' default — trying Stage 4b so the actual question "
+                          "gets a chance at a real answer",
+            }}
 
-    if resolved_intent is None:
-        yield {"stage": "no_intent_match", "detail": {
-            "reason": "confidence below threshold, no tracking_id to fall back on, "
-                      "no LLM fallback in v0",
-        }}
-        yield from _finish(query, extracted, None, CLARIFYING_ANSWER, [])
-        return
+    filled = None
+    if resolved_intent is not None:
+        filled = sql_templates.fill_template(resolved_intent, extracted)
+        if filled is None:
+            yield {"stage": "sql_generation_failed", "detail": {
+                "reason": "intent matched but a required entity (e.g. tracking_id) "
+                          "wasn't found in the query — trying the Stage 4b LLM fallback",
+            }}
 
-    filled = sql_templates.fill_template(resolved_intent, extracted)
     if filled is None:
-        yield {"stage": "sql_generation_failed", "detail": {
-            "reason": "intent matched but a required entity (e.g. tracking_id) "
-                      "wasn't found in the query, and there's no LLM fallback in v0",
+        # Stage 4a is exhausted — either nothing matched, or something matched
+        # but couldn't be filled. Try the LLM fallback (v1) before declining.
+        # Waterfall, not merge: this is the ONLY entry point into Stage 4b,
+        # and it's only reached after Stage 4a has already had its shot.
+        yield {"stage": "llm_sql_fallback_attempting", "detail": {
+            "entities": scoped.entities,
         }}
-        yield from _finish(query, extracted, resolved_intent, CLARIFYING_ANSWER, [])
-        return
+        filled = sql_llm.draft_sql(query, scoped.entities, extracted)
+        if filled is None:
+            yield {"stage": "no_intent_match", "detail": {
+                "reason": "no template matched and the LLM fallback (if configured) "
+                          "couldn't draft a usable query",
+            }}
+            yield from _finish(query, extracted, resolved_intent, CLARIFYING_ANSWER, [])
+            return
 
     yield {"stage": "sql_generated", "detail": {
-        "sql": filled.sql.strip(), "params": filled.params, "source": "template",
+        "sql": filled.sql.strip(), "params": filled.params, "source": filled.source,
     }}
 
     try:
-        validated_sql = guardrails.validate_sql(filled.sql, [filled.table_key])
+        validated_sql = guardrails.validate_sql(filled.sql, filled.entity_keys)
     except guardrails.GuardrailError as exc:
         yield {"stage": "sql_rejected", "detail": {"reason": str(exc)}}
         yield from _finish(query, extracted, resolved_intent, REJECTED_ANSWER, [])
@@ -172,10 +250,27 @@ def run_pipeline(query: str):
     yield {"stage": "sql_validated", "detail": {"status": "accepted"}}
     yield {"stage": "executing", "detail": {}}
 
-    result = executor.execute_query(validated_sql, filled.params)
+    try:
+        result = executor.execute_query(validated_sql, filled.params)
+    except executor.ExecutionError as exc:
+        # Structurally-safe SQL can still fail at runtime (timeout, deadlock)
+        # — must degrade cleanly, not crash the stream. Same defensive
+        # pattern as the audit-log FK-violation fix.
+        yield {"stage": "execution_failed", "detail": {"reason": str(exc)}}
+        yield from _finish(query, extracted, resolved_intent, EXECUTION_FAILED_ANSWER, [])
+        return
     yield {"stage": "rows_returned", "detail": {
         "count": result.row_count, "elapsed_ms": result.elapsed_ms,
     }}
 
-    answer = respond_template.format_response(resolved_intent, result.rows, extracted)
-    yield from _finish(query, extracted, resolved_intent, answer.model_dump(), result.rows)
+    # Stage 7 routing: Stage 4a's output always goes to the v0 template
+    # formatter (0 LLM cost, unchanged, proven); only Stage 4b's output
+    # reaches the v1 LLM synthesizer — see AGENTIC_RAG_ARCHITECTURE.md §4
+    # Stage 7 for why this is routing, not a full replacement.
+    if filled.source == "llm":
+        answer = synthesize.synthesize(query, result.rows)
+    else:
+        answer = respond_template.format_response(resolved_intent, result.rows, extracted)
+
+    audit_intent = resolved_intent or "llm_drafted"
+    yield from _finish(query, extracted, audit_intent, answer.model_dump(), result.rows)

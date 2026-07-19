@@ -32,6 +32,33 @@ def _parseable_copy(sql: str) -> str:
     return _PSYCOPG2_PARAM_RE.sub("'__PARAM__'", sql)
 
 
+def _select_aliases(tree: exp.Select) -> set:
+    """Names introduced by any SELECT list in the query — top-level AND
+    nested (subqueries, derived tables) — e.g. `count(*) AS shipment_count`
+    or a derived table's `created_at::date AS day`. Legitimately referenced
+    by an outer ORDER BY/GROUP BY/HAVING or by `alias.column` from an
+    enclosing join without being a real table column. sqlglot's exp.Column
+    nodes don't distinguish "real column" from "reference back to an alias"
+    at parse time, so both look identical to find_all(exp.Column).
+
+    Walking every nested exp.Select (not just the outermost) matters in
+    practice, not just in theory: a two-subquery FULL OUTER JOIN rewrite of
+    the daily_volume_trend template (bounded date-range aggregates instead
+    of an expensive unbounded generate_series — see
+    AGENTIC_RAG_ARCHITECTURE.md §9) was being wrongly rejected as
+    'unknown column: cnt' before this fix, because `cnt` was a derived
+    table's internal alias, never captured by only scanning the outer
+    SELECT list. This doesn't weaken the allow-list: an alias, at any
+    nesting depth, can only ever refer to a value its own SELECT list
+    already computed from already-checked real columns — it never grants
+    access to anything new, the same reasoning as the top-level-only
+    version this replaces."""
+    aliases = set()
+    for select in tree.find_all(exp.Select):
+        aliases |= {e.alias for e in select.expressions if e.alias}
+    return aliases
+
+
 def validate_sql(sql: str, allowed_entity_keys: list) -> str:
     """Raises GuardrailError if `sql` does anything outside the allow-list
     derived from `allowed_entity_keys` (schema JSON entity/view keys).
@@ -73,7 +100,7 @@ def validate_sql(sql: str, allowed_entity_keys: list) -> str:
         )
 
     columns = {c.name for c in tree.find_all(exp.Column)}
-    unknown_columns = columns - allowed_columns
+    unknown_columns = columns - allowed_columns - _select_aliases(tree)
     if unknown_columns:
         raise GuardrailError(f"query references unknown columns: {unknown_columns}")
 

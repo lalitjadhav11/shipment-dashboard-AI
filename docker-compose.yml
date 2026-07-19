@@ -53,6 +53,18 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-shipdb_phase1}
       # Read-only role for the AI chat agent — see AGENTIC_RAG_ARCHITECTURE.md §4 Stage 5/6.
       AGENT_DATABASE_URL: postgresql://agent_ro:${AGENT_DB_PASSWORD:-agent_ro_pw}@db:5432/${POSTGRES_DB:-shipdb_phase1}
+      # v1 only (Stage 4b LLM SQL draft, Stage 7 v1 synthesis) — optional. Unset
+      # means those stages degrade gracefully to v0's clarifying/template answers.
+      # Provider switch — "anthropic" (cloud, needs a key + credit) or "ollama"
+      # (local model, needs `ollama pull <model>` on the host already done) —
+      # both implement the same call_tool() contract, see llm_client.py.
+      AGENT_LLM_PROVIDER: ${AGENT_LLM_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_LLM_MODEL: ${AGENT_LLM_MODEL:-claude-haiku-4-5-20251001}
+      AGENT_OLLAMA_MODEL: ${AGENT_OLLAMA_MODEL:-llama3.1}
+      # host.docker.internal resolves to the host machine from inside the
+      # container — Ollama runs on the host, not in this Compose stack.
+      AGENT_OLLAMA_HOST: ${AGENT_OLLAMA_HOST:-http://host.docker.internal:11434}
     depends_on:
       db:
         condition: service_healthy
@@ -64,6 +76,10 @@ services:
       # Persists the sentence-transformers model download across container
       # restarts / rebuilds so it isn't re-fetched from HuggingFace every time.
       - hf_cache:/root/.cache/huggingface
+    extra_hosts:
+      # host.docker.internal is automatic on Docker Desktop (Win/Mac) but
+      # needs this explicit mapping on native Linux Docker to reach Ollama.
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     restart: unless-stopped

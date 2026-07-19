@@ -56,6 +56,90 @@
         "entities": ["customer", "shipment"],
         "recommended_query": "SELECT * FROM v_top_customers;",
         "example_nl": "Who are our top shippers and how's their on-time rate?"
+      },
+      {
+        "intent": "dashboard_headline",
+        "entities": ["v_dashboard_headline"],
+        "recommended_query": "SELECT * FROM v_dashboard_headline;",
+        "example_nl": "Give me the overall dashboard summary."
+      },
+      {
+        "intent": "status_breakdown",
+        "entities": ["v_status_breakdown"],
+        "recommended_query": "SELECT * FROM v_status_breakdown ORDER BY shipment_count DESC;",
+        "example_nl": "Give me a breakdown of shipments by current status."
+      },
+      {
+        "intent": "ontime_performance",
+        "entities": ["v_ontime_performance"],
+        "recommended_query": "SELECT * FROM v_ontime_performance;",
+        "example_nl": "What's our overall on-time delivery performance?"
+      },
+      {
+        "intent": "delay_reason_breakdown",
+        "entities": ["v_delay_reason_breakdown"],
+        "recommended_query": "SELECT * FROM v_delay_reason_breakdown ORDER BY shipment_count DESC;",
+        "example_nl": "What are the most common reasons shipments are delayed?"
+      },
+      {
+        "intent": "domestic_vs_international_split",
+        "entities": ["v_domestic_vs_international"],
+        "recommended_query": "SELECT * FROM v_domestic_vs_international;",
+        "example_nl": "How many domestic versus international shipments do we have?"
+      },
+      {
+        "intent": "daily_volume_trend",
+        "entities": ["v_daily_volume_trend"],
+        "recommended_query": "SELECT * FROM v_daily_volume_trend ORDER BY day DESC LIMIT 14;",
+        "example_nl": "Show me shipment volume trend over the last two weeks."
+      },
+      {
+        "intent": "service_level_mix",
+        "entities": ["v_service_level_mix"],
+        "recommended_query": "SELECT * FROM v_service_level_mix ORDER BY shipment_count DESC;",
+        "example_nl": "How is each delivery service level performing?"
+      },
+      {
+        "intent": "chat_activity_summary",
+        "entities": ["v_chat_activity_summary"],
+        "recommended_query": "SELECT * FROM v_chat_activity_summary;",
+        "example_nl": "How is the AI chat feature being used?"
+      },
+      {
+        "intent": "shipments_by_customer",
+        "entities": ["shipment", "customer"],
+        "recommended_query": "SELECT s.* FROM shipments s JOIN customers c ON c.customer_id = s.customer_id WHERE c.org_name = $1;",
+        "example_nl": "Show me all shipments for Acme Corp."
+      },
+      {
+        "intent": "shipments_by_customer_delayed",
+        "entities": ["shipment", "customer"],
+        "recommended_query": "SELECT s.* FROM shipments s JOIN customers c ON c.customer_id = s.customer_id WHERE c.org_name = $1 AND s.reason_for_delay <> 'NONE';",
+        "example_nl": "Which of Acme Corp's shipments are currently delayed?"
+      },
+      {
+        "intent": "shipments_by_status",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT * FROM shipments WHERE current_status = $1 ORDER BY updated_at DESC LIMIT 20;",
+        "example_nl": "Show me shipments that are lost."
+      },
+      {
+        "intent": "shipments_by_package_type",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT * FROM shipments WHERE package_type = $1 ORDER BY created_at DESC LIMIT 20;",
+        "example_nl": "Show me all pallet-sized package shipments."
+      },
+      {
+        "intent": "shipments_by_delivery_type",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT * FROM shipments WHERE delivery_type = $1 ORDER BY created_at DESC LIMIT 20;",
+        "example_nl": "Show me all express delivery shipments."
+      },
+      {
+        "intent": "failed_delivery_shipments",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT * FROM shipments WHERE failed_delivery_attempts > 0 ORDER BY failed_delivery_attempts DESC LIMIT 20;",
+        "example_nl": "Which shipments have had failed delivery attempts?"
       }
     ]
   },
@@ -126,7 +210,7 @@
         "pickup_window_end": { "datatype": "TIME", "description": "Pickup window end", "sample_value": "17:00:00", "nullable": true },
         "delivery_window_start": { "datatype": "TIMESTAMPTZ", "description": "Folded-in delivery appointment window start", "sample_value": null, "nullable": true },
         "delivery_window_end": { "datatype": "TIMESTAMPTZ", "description": "Folded-in delivery appointment window end", "sample_value": null, "nullable": true },
-        "current_status": { "datatype": "ENUM shipment_status_enum", "description": "Authoritative journey stage — see lifecycle_state_machine. Auto-logs to tracking_events via trigger on every change.", "sample_value": "CUSTOMS_HOLD", "nullable": false, "default": "LABEL_CREATED" },
+        "current_status": { "datatype": "ENUM shipment_status_enum", "description": "Authoritative journey stage — see lifecycle_state_machine. Auto-logs to tracking_events via trigger on every change.", "sample_value": "CUSTOMS_HOLD", "nullable": false, "default": "LABEL_CREATED", "allowed_values": ["LABEL_CREATED", "SHIPMENT_CREATED", "PACKAGE_RECEIVED", "TRACKING_ID_ISSUED", "IN_TRANSIT_TO_ORIGIN_HUB", "AT_DISTRIBUTION_HUB", "IN_TRANSIT", "AT_CONNECTING_HUB", "CUSTOMS_HOLD", "CUSTOMS_CLEARED", "IN_TRANSIT_TO_DESTINATION_HUB", "OUT_FOR_DELIVERY", "DELIVERED", "DELIVERY_FAILED", "RETURNED_TO_SENDER", "LOST", "CANCELLED"] },
         "estimated_delivery": { "datatype": "TIMESTAMPTZ", "description": "ETA", "sample_value": "2026-07-19T18:00:00Z", "nullable": true },
         "delivery_date": { "datatype": "TIMESTAMPTZ", "description": "Actual delivery timestamp, null until DELIVERED", "sample_value": null, "nullable": true },
         "reason_for_delay": { "datatype": "ENUM reason_for_delay_enum", "description": "Root cause category when delayed", "sample_value": "CUSTOMS", "nullable": false, "default": "NONE", "allowed_values": ["NONE", "CUSTOMS", "WEATHER", "CIVIL_UNREST", "LOST_PACKAGE", "MECHANICAL_ISSUE", "ADDRESS_ISSUE", "OTHER"] },

@@ -36,8 +36,8 @@ for the full stage reference, the AI chat's grounded-context design
 | Scenario-based data generator (25k shipments / 800 customers)        | ✅ Done (`03_generate_phase1_data.py`, run by the `seeder` service) |
 | Backend API (FastAPI) — hello world, health check, KPI reads         | ✅ Done, boilerplate (`backend/main.py`) |
 | Frontend (React) — hello world screen, pings backend                 | ✅ Done, boilerplate (`frontend/src`) |
-| **AI Shipment Journey Summary chat — v0** (deterministic, zero-LLM backbone) | ✅ Done (`backend/chat/`) — intent classification, entity extraction, schema scoping, template SQL, guardrail validation, and response formatting all run without an LLM call. See [`AGENTIC_RAG_ARCHITECTURE.md`](AGENTIC_RAG_ARCHITECTURE.md) |
-| **AI chat v1** (LLM SQL fallback + LLM response synthesis) | ⏳ Not yet implemented — v0's two LLM touchpoints (Stage 4b, Stage 7) are still stubs |
+| **AI Shipment Journey Summary chat — v0** (deterministic, zero-LLM backbone) | ✅ Done (`backend/chat/`) — intent classification, entity extraction, schema scoping, template SQL, guardrail validation, and response formatting all run without an LLM call. **20 templates** covering every dashboard view plus mix-and-match filters (by customer, status, package type, delivery type). See [`AGENTIC_RAG_ARCHITECTURE.md`](AGENTIC_RAG_ARCHITECTURE.md) §10 |
+| **AI chat v1** (LLM SQL fallback + LLM response synthesis) | ✅ Done and **live-verified end-to-end** with a local Ollama model — a genuine `GROUP BY` question ("group shipments by package type and show how many are delayed") got a correctly-drafted query, guardrail-validated, executed, and synthesized into a natural-language answer with follow-up suggestions. Supports two interchangeable providers via `AGENT_LLM_PROVIDER` — `anthropic` (cloud) or `ollama` (local, no API cost) — switching is one env var, no code change. See `AGENTIC_RAG_ARCHITECTURE.md` §9 |
 | Real dashboard UI (charts/tables over the 10 summary views)          | ⏳ Not yet implemented |
 
 ## Architecture
@@ -150,7 +150,7 @@ stack to another machine.
 | GET    | `/health`               | Liveness + DB connectivity                |
 | GET    | `/api/summary`          | `v_dashboard_headline` — 10 KPIs          |
 | GET    | `/api/status-breakdown` | `v_status_breakdown`                      |
-| POST   | `/api/chat`              | AI Shipment Journey Summary chat (v0) — streams Server-Sent Events, one per pipeline stage, ending with `answer_ready`. Send `{"query": "..."}`. |
+| POST   | `/api/chat`              | AI Shipment Journey Summary chat — streams Server-Sent Events, one per pipeline stage, ending with `answer_ready`. Send `{"query": "..."}`. Falls back to Stage 4b (LLM) when no template matches, if `ANTHROPIC_API_KEY` is set — see status table above. |
 | GET    | `/api/chat/history`      | Read `shipment_chat_log` for QA (optional `?tracking_id=`) |
 
 `/api/chat`'s intermediate "thinking" trace (intent, extracted entities, scoped
@@ -178,3 +178,8 @@ All settings have defaults; override by copying `.env.example` to `.env`:
 | `SEED_CUSTOMERS`    | `800`           | Customer count                         |
 | `SEED_RANDOM_SEED`  | `42`            | Deterministic generation seed          |
 | `AGENT_DB_PASSWORD` | `agent_ro_pw`   | Password for the read-only `agent_ro` DB role the chat agent uses |
+| `AGENT_LLM_PROVIDER` | `anthropic`    | v1 LLM provider — `anthropic` (cloud) or `ollama` (local); same interface either way |
+| `ANTHROPIC_API_KEY` | *(none)*        | Required only if `AGENT_LLM_PROVIDER=anthropic`; also needs account credit |
+| `AGENT_LLM_MODEL`   | `claude-haiku-4-5-20251001` | Anthropic model, used only when that provider is active |
+| `AGENT_OLLAMA_MODEL` | `llama3.1`     | Ollama model tag — must already be pulled (`ollama pull <model>`) and support tool/function calling |
+| `AGENT_OLLAMA_HOST` | `http://host.docker.internal:11434` | Where the backend container reaches Ollama running on the host |

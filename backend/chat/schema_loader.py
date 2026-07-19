@@ -119,3 +119,43 @@ def warm_up() -> None:
     """Call at FastAPI startup so the first user request isn't the one
     paying for the model load + embedding precompute."""
     get_state()
+
+
+def describe_entities(entity_keys: list) -> str:
+    """LLM-readable data dictionary for a Stage-3-scoped subset of entities —
+    this text IS the allow-list surface shown to Stage 4b's prompt (v1). Only
+    ever called with the narrowed list, never the full schema, so the prompt
+    stays small regardless of how large the schema grows (see
+    AGENTIC_RAG_ARCHITECTURE.md §4 Stage 3)."""
+    schema = get_state()["raw"]
+    schema_objects = {**schema["entities"], **schema["views"]}
+    blocks = []
+
+    for key in entity_keys:
+        obj = schema_objects.get(key)
+        if obj is None:
+            continue
+        table = table_name(key)
+
+        if "fields" in obj:  # entity — full field-level detail, incl. enums
+            lines = [f"TABLE {table} ({obj.get('description', '')})"]
+            for field_name, field in obj["fields"].items():
+                allowed = field.get("allowed_values")
+                enum_note = f" — one of: {', '.join(allowed)}" if allowed else ""
+                lines.append(f"  - {field_name} {field['datatype']}{enum_note}")
+        else:  # view — column list, matches what the view actually exposes
+            purpose = obj.get("purpose") or obj.get("description") or ""
+            lines = [f"VIEW {table} ({purpose})", f"  columns: {', '.join(obj['columns'])}"]
+            # "grain" often documents exact string casing for computed/categorical
+            # columns (e.g. "one row per shipment_scope (DOMESTIC/INTERNATIONAL)")
+            # that isn't captured anywhere else — dropping it silently let a real
+            # model draft `= 'international'` against data stored as 'INTERNATIONAL'
+            # and get zero rows back instead of an error. Postgres string
+            # comparison is case-sensitive, so this is a real correctness gap,
+            # not just a style nicety.
+            if obj.get("grain"):
+                lines.append(f"  grain: {obj['grain']}")
+
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)

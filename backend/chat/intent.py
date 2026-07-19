@@ -26,20 +26,41 @@ class IntentResult:
     matched_example: str | None
 
 
-def classify_intent(query: str) -> IntentResult:
+@dataclass
+class RankedIntent:
+    intent: str
+    example_nl: str
+    score: float
+
+
+def rank_intents(query: str) -> list:
+    """Every known intent, ranked by similarity to `query`, best first.
+    classify_intent() only ever looks at index 0 (v0). Stage 4b (v1) reuses
+    this same computation to pick few-shot example templates from indices
+    1-3 — see AGENTIC_RAG_ARCHITECTURE.md §4 Stage 1's note on this."""
     state = schema_loader.get_state()
     intent_bank = state["intent_bank"]
     if not intent_bank:
-        return IntentResult(intent=None, confidence=0.0, matched_example=None)
+        return []
 
     q_vec = schema_loader.embed(query)
-    best = max(
-        intent_bank,
-        key=lambda entry: schema_loader.cosine(q_vec, entry["vector"]),
+    ranked = sorted(
+        (
+            RankedIntent(entry["intent"], entry["example_nl"], schema_loader.cosine(q_vec, entry["vector"]))
+            for entry in intent_bank
+        ),
+        key=lambda r: -r.score,
     )
-    score = schema_loader.cosine(q_vec, best["vector"])
+    return ranked
 
-    if score < CONFIDENCE_THRESHOLD:
-        return IntentResult(intent=None, confidence=score, matched_example=best["example_nl"])
 
-    return IntentResult(intent=best["intent"], confidence=score, matched_example=best["example_nl"])
+def classify_intent(query: str) -> IntentResult:
+    ranked = rank_intents(query)
+    if not ranked:
+        return IntentResult(intent=None, confidence=0.0, matched_example=None)
+
+    best = ranked[0]
+    if best.score < CONFIDENCE_THRESHOLD:
+        return IntentResult(intent=None, confidence=best.score, matched_example=best.example_nl)
+
+    return IntentResult(intent=best.intent, confidence=best.score, matched_example=best.example_nl)

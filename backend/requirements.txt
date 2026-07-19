@@ -7,3 +7,11 @@ sentence-transformers==3.0.1   # Stage 1/3 embeddings (all-MiniLM-L6-v2, CPU)
 rapidfuzz==3.9.6                # Stage 2 fuzzy entity matching
 dateparser==1.2.0               # Stage 2 relative-date extraction
 sqlglot==25.1.0                 # Stage 5 SQL AST guardrail validator
+
+# --- AI chat agent (v1 addition — Stage 4b LLM SQL draft, Stage 7 v1 synthesis) ---
+# 0.39.0 crashed at runtime (TypeError: Client.__init__() got an unexpected
+# keyword argument 'proxies') — incompatible with the httpx 0.28+ pulled in
+# transitively by sentence-transformers/huggingface-hub. Pinned to a version
+# confirmed compatible with that httpx line.
+anthropic==0.69.0
+ollama==0.6.2                   # local-model alternative, see AGENT_LLM_PROVIDER in llm_client.py

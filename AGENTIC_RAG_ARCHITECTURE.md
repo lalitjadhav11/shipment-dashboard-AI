@@ -1,11 +1,30 @@
 # Agentic RAG Architecture — Shipment Journey Summary Chat
 
 Design for the AI chat feature specified in `Phase1_Shipment_Customer_Design_Document.docx`
-(§4) and grounded in `02_phase1_agentic_schema.json`. Status: **v0 implemented** in
-`backend/chat/` (see `README.md` implementation-status table and the `/api/chat` endpoint
-docs) — Stages 1-3, 4a, 5, 6, and the v0 Stage 7 template formatter are live and tested
-end-to-end against the seeded database. v1 (Stage 4b LLM SQL fallback + LLM Stage 7
-synthesis) is still design-only.
+(§4) and grounded in `02_phase1_agentic_schema.json`. Status: **v0 and v1 both fully implemented
+and live-verified end-to-end**, including a genuine LLM-drafted `GROUP BY` query executing
+correctly against the real database and getting synthesized into a correct natural-language
+answer.
+
+- **v0** (Stages 1-3, 4a, 5, 6, Stage 7 v0 template formatter): live in `backend/chat/`,
+  tested end-to-end against the seeded database, including a corner-case audit (see §9).
+- **v1** (Stage 4b LLM SQL draft, Stage 7 v1 LLM synthesis, `sql_llm.py`/`synthesize.py`/
+  `llm_client.py`): live-verified with two interchangeable LLM providers, switched by
+  `AGENT_LLM_PROVIDER` — **`anthropic`** (cloud) and **`ollama`** (local, no API cost) — both
+  behind the exact same `call_tool()` contract, so `sql_llm.py`/`synthesize.py` never branch on
+  which is active. Verified along the way: graceful degradation with no provider configured/
+  reachable (falls through to v0's clarifying answer, no crash); the Stage 4b → Stage 5
+  guardrail round-trip caught and fixed a real bug (aliased `SELECT` columns like
+  `count(*) AS shipment_count` were wrongly rejected — fixed in `guardrails.py`'s
+  `_select_aliases`); an `anthropic==0.39.0`/`httpx 0.28+` incompatibility that crashed on
+  client construction (pinned to `0.69.0`); and a reliability gap specific to the local
+  provider — Ollama's API has no Anthropic-style forced tool-choice, so the model sometimes
+  responded with plain text instead of calling the tool, fixed by adding an explicit "you MUST
+  call this function" instruction to both Stage 4b's and Stage 7 v1's system prompts. **A
+  genuine end-to-end pass then succeeded**, live, against a local `gemma4:12b` model: "group
+  shipments by package type and show how many are delayed" → correct `GROUP BY` SQL drafted →
+  passed the guardrail → executed against the real 25k-row dataset → synthesized into a correct,
+  natural-language answer with sensible follow-up suggestions. See §9 for the full test record.
 
 ## 1. Design principles (from requirements)
 
@@ -36,15 +55,26 @@ top of an already-working, already-tested backbone.
 | 4. SQL Generation | ✅ **4a only** — template fill for known intents; unmatched queries get a static "I can currently only answer questions about tracking status, delay reasons, customs, and open issues" response | ➕ **4b** — LLM drafts SQL for low-confidence/unmatched queries, given the Stage-3 entity slice *plus* the 2-3 nearest existing templates as few-shot examples (reusing Stage 1's ranking) |
 | 5. Guardrail Validator | ✅ full `sqlglot` validator — runs even in v0, protecting template output too (defense in depth from day one) | unchanged, now also gates 4b's output |
 | 6. Execute | ✅ pooled, read-only, timeout, row cap | unchanged |
-| 7. Response Formatting | ✅ **plain string templates** per intent (e.g. `f"Your package is currently {status}..."`) | ➕ replaces the template formatter with an **LLM tool-call** for natural phrasing and to handle 4b's ad-hoc results |
-| LLM calls per request | **0** | up to 2 |
+| 7. Response Formatting | ✅ **plain string templates** per intent (e.g. `f"Your package is currently {status}..."`) — the only formatter that exists | ➕ **routed by which stage produced the SQL, not a full replacement**: Stage 4a's output still goes to Stage 7 v0 (unchanged, 0 LLM cost); only Stage 4b's output goes to the new **LLM tool-call** Stage 7 v1 |
+| LLM calls per request | **0** | 0 for the 6 known intents (unchanged); up to 2 only when Stage 4b fires |
 | New dependency | `sentence-transformers`, `rapidfuzz`, `dateparser`, `sqlglot`, `asyncpg`, `sse-starlette` | + Anthropic SDK |
 
-v0 already covers the majority of expected traffic — the five `query_patterns` intents already
-defined in the schema JSON (where-is-it, why-is-it-late, customs status, open issues, top
-customers) — end to end, fully guardrailed, fully testable, with deterministic output. v1 only
-extends coverage to ad-hoc/analytical phrasing and upgrades response quality; it does not touch
-Stages 1-3, 5, or 6.
+v0 already covers the majority of expected traffic — **20** `query_patterns` intents now
+defined in the schema JSON (originally 6; expanded per §10 to cover every dashboard view plus
+genuine mix-and-match filters — by customer, status, package type, delivery type, and joined
+customer+delay combinations) — end to end, fully guardrailed, fully testable, with deterministic
+output. v1 only extends coverage to ad-hoc/analytical phrasing that Stage 4a structurally can't
+template; it does not touch Stages 1-3, 5, or 6, and — per the routing above — it doesn't touch
+the response path for any of the 20 known intents either.
+
+**Why routing, not a full swap:** Stage 4b's output has nowhere to go without *some* new
+formatter — `respond_template.py`'s `_FORMATTERS` dict only has entries for the known intents,
+so a novel, LLM-drafted query would otherwise hit the "I wasn't able to generate a response for
+this query" fallback and silently discard correctly-fetched data. Stage 7 v1 exists to close
+that gap. But making it a *full* replacement — every request pays for an LLM call, even the ones
+Stage 4a already answers perfectly — would violate the "don't spend an LLM call where a
+deterministic answer already works" principle for zero benefit on that traffic. Routing by
+origin gets the coverage Stage 4b needs without the cost regression a full swap would cause.
 
 ## 3. Pipeline overview
 
@@ -61,8 +91,9 @@ flowchart TD
     G --> H
     H -- reject --> R[Return clarifying error, log, stop]
     H -- accept --> I["Stage 6 — Execute\n(read-only role, timeout, row cap)"]
-    I --> J0["Stage 7 v0 — Template formatter\n(plain string, no LLM)"]
-    I --> J1["Stage 7 v1 — LLM Response Synthesis\n(tool-call, fixed JSON schema)"]
+    I --> S{Which stage produced\nthis SQL — 4a or 4b?}
+    S -- "4a (template)" --> J0["Stage 7 v0 — Template formatter\n(plain string, no LLM)"]
+    S -- "4b (LLM, v1 only)" --> J1["Stage 7 v1 — LLM Response Synthesis\n(tool-call, fixed JSON schema)"]
     J0 --> K[Structured response to user]
     J1 --> K
     B & C & D & F & H & I -.SSE trace event.-> T[/verbose trace stream/]
@@ -74,6 +105,10 @@ flowchart TD
     classDef v1 fill:#fff3cd,stroke:#d39e00,color:#000;
     class G,J1 v1;
 ```
+
+Stage 7's routing decision (`S`) is not a new ranking or scoring step — it's just "which branch,
+4a or 4b, produced this SQL" carried forward as a tag, the same way `sql_generated`'s `source`
+field already distinguishes `"template" | "llm"` in the trace (§5).
 
 Stages 1 and 2 have no dependency on each other — both only need the raw query text — so they
 run **concurrently** (`asyncio.gather`), not strictly in sequence; Stage 3 is the first point
@@ -302,14 +337,17 @@ def format_response(intent: str, row: dict) -> dict:
     }
 ```
 
-Deterministic and instant, but only covers the fixed set of known intents/phrasings — this is
-what v1's LLM synthesis replaces.
+Deterministic and instant, but only covers the fixed set of known intents/phrasings. In v1,
+**this stays the formatter for every Stage-4a (template) result — it is not replaced.** Only
+queries that fell through to Stage 4b (no known intent matched) route to Stage 7 v1 instead;
+see the routing rationale in §2.
 
-### Stage 7 v1 — LLM Response Synthesis `[v1 addition]` (constrained output)
+### Stage 7 v1 — LLM Response Synthesis `[v1 addition]` (constrained output, Stage-4b path only)
 
-Replaces the v0 template formatter. A second, narrow LLM call: given the row results and the
-original question, produce the customer-facing answer **as a tool-call against a fixed
-Pydantic schema**, e.g.:
+Does not replace Stage 7 v0 — it's the formatter for the one case Stage 7 v0 structurally can't
+handle: a query with no matching known intent, whose SQL Stage 4b drafted instead of a template.
+A second, narrow LLM call: given the row results and the original question, produce the
+customer-facing answer **as a tool-call against a fixed Pydantic schema**, e.g.:
 
 ```python
 class ShipmentAnswer(BaseModel):
@@ -322,12 +360,22 @@ class ShipmentAnswer(BaseModel):
 ```
 
 Forcing structured output here (rather than parsing free text) is itself a guardrail — the
-API contract to the frontend never depends on the LLM "remembering" to format things a
-certain way, so v1 is a drop-in replacement for v0's formatter without changing what Stage 6
-hands downstream. `confidence_score` below 0.75 flags `requires_human_review` per the design
-doc, and in both v0 and v1 every interaction (query, SQL used, rows returned, answer,
-confidence) is written to `shipment_chat_log` for QA — this doubles as the system's audit
-trail from day one.
+API contract to the frontend is identical regardless of which Stage 7 produced it (same
+`ShipmentAnswer` shape), so the frontend never needs to know or care whether a given answer came
+from Stage 7 v0 or v1 — only Stage 6's rows differ, not what either formatter hands downstream.
+`confidence_score` below 0.75 flags `requires_human_review` per the design doc, and regardless of
+which Stage 7 ran, every interaction (query, SQL used, rows returned, answer, confidence) is
+written to `shipment_chat_log` for QA — this doubles as the system's audit trail from day one.
+
+**Build-order note:** since Stage 7 v1 only ever receives Stage 4b's output, the two ship
+together as a connected pair (see §2's dependency rationale) — but they don't have to be *built*
+in lockstep. Getting Stage 4b's SQL-drafting quality solid first, with Stage 7 v1 starting as a
+minimal pass-through (dump the rows into `supporting_data` with a generic "here's what I found"
+answer) rather than fully tuned phrasing, isolates the higher-risk piece (does the LLM draft
+safe, useful SQL?) from response-quality polish. The granular SSE trace already built in v0
+supports this: `sql_generated` and `answer_ready` are separate events, so SQL-drafting
+correctness and answer-phrasing quality can be inspected and iterated on independently even
+though both stages ship in the same release.
 
 ## 5. Streaming the "thinking" trace `[v0]`
 
@@ -396,7 +444,7 @@ this scale. Going from v0 to v1 is two new files and a couple of `if` branches i
 | DB access | `asyncpg` (or existing `psycopg2` for parity) | v0 |
 | Streaming | `sse-starlette` | v0 |
 | Audit | `shipment_chat_log` table (already in schema) | v0 |
-| LLM calls | Anthropic Python SDK, tool-use/structured output | **v1 only** |
+| LLM calls | Anthropic Python SDK (`anthropic==0.69.0` — 0.39.0 crashes, see §9) **or** `ollama` Python client, switched by `AGENT_LLM_PROVIDER` — same `call_tool()` contract either way | **v1 only** |
 
 ## 8. Scalability path
 
@@ -487,17 +535,257 @@ shipment...") had already been computed and was one yield away from reaching the
 the sharpest illustration of the audit rule adopted in the fix: **logging is a side effect and
 must never be allowed to crash the primary response the user is waiting on.**
 
-### What's still a genuine v0 boundary — not fixed, and not fixable without v1
+### What was a genuine v0 boundary — now implemented in v1, not yet live-verified
 
-- **True multi-shipment comparison** ("which of these two is more delayed and why") — the
-  multi-ID guard above stops it from answering *wrong*, but doesn't make it *answerable*.
-  Doing this properly needs either two queries + synthesis, or an LLM reasoning across both
-  result sets — a Stage 4b/7-v1 job, not a bigger template.
-- **Ad-hoc grouping/reporting** ("group shipments by package type...") — covered in §8's
-  raw-table section above. Structurally blocked until Stage 4b exists to write the `GROUP BY`.
-- **Genuinely novel phrasing outside all 6 known shapes** — the confidence floor (0.40) still
-  declines these, correctly. Lowering it further to "catch more" would start eroding the clean
-  gap from the true-negative tests above — that's exactly the point where the honest answer is
-  "build Stage 4b," not "keep lowering the threshold."
+These were the concrete, evidence-based v1 priority list from the v0 audit — not hypothetical.
+Stage 4b/7-v1 now exist and are wired to handle all three, but none has been exercised against
+a real LLM call yet (no API key was available in the build environment — see below):
 
-These three are the concrete, evidence-based v1 priority list — not a hypothetical one.
+- **Ad-hoc grouping/reporting** ("group shipments by package type...") — this is what actually
+  drove `guardrails.py`'s `_select_aliases` fix (found via a mocked Stage 4b response using
+  exactly this query — see §4 Stage 5). Code path is exercised and correct against that mock;
+  untested against what a real model actually drafts for it.
+- **Genuinely novel phrasing outside all 6 known shapes** — now routes through Stage 4b instead
+  of immediately declining. The confidence floor (0.40) for the *template* path is unchanged and
+  still correctly gates Stage 4a; Stage 4b is the fallback for what it doesn't catch.
+- **True multi-shipment comparison** ("which of these two is more delayed and why") — **still
+  not handled.** The multi-tracking-ID guard in `pipeline.py` intercepts these *before* Stage 3
+  even runs, by design (see the corner-case audit above), so they never reach Stage 4b at all.
+  This remains a real gap — closing it means teaching the multi-ID guard to route into Stage 4b
+  (multiple queries + cross-result synthesis) instead of always declining, which hasn't been
+  built. Worth flagging as the next concrete piece of scope, not silently left open.
+
+### v1 live verification — full test record
+
+**Provider abstraction.** `llm_client.py` supports two providers behind one `call_tool()`
+contract, switched by `AGENT_LLM_PROVIDER`:
+- `anthropic` — cloud, needs `ANTHROPIC_API_KEY` + account credit. Supports forced tool-choice
+  (`tool_choice={"type": "tool", "name": ...}`), so the model has no way to respond without
+  calling the function.
+- `ollama` — local, needs `ollama pull <model>` already done on the host and a model with tool-
+  calling support (confirmed via `capabilities` in `ollama list` / `/api/tags`). Reached from
+  inside the backend container via `host.docker.internal` (an explicit `extra_hosts` mapping in
+  `docker-compose.yml` makes this work on native Linux Docker too, not just Docker Desktop).
+  **No forced tool-choice exists in Ollama's API** — the model decides on its own whether to
+  call the tool, which is a real reliability gap smaller/local models can have.
+
+**Bugs found and fixed via actual live calls, not mocks:**
+1. `anthropic==0.39.0` crashed on client construction (`TypeError: unexpected keyword argument
+   'proxies'`) — incompatible with the `httpx 0.28+` this project's other dependencies pull in.
+   Pinned to `0.69.0`.
+2. The local model (`gemma4:12b-it-q4_K_M`) intermittently responded with plain text instead of
+   invoking the tool — expected, given Ollama has no forced-tool-choice lever. Fixed by adding
+   an explicit "You MUST respond by calling the `{tool_name}` function — never respond with
+   plain text" instruction to the end of both Stage 4b's and Stage 7 v1's system prompts. This
+   is a provider-agnostic addition (harmless for Anthropic, which already forces tool choice;
+   load-bearing for Ollama, which doesn't) — no per-provider prompt branching needed.
+
+**A genuine end-to-end pass succeeded, live, after those fixes**, using the local Ollama
+provider (`gemma4:12b-it-q4_K_M`) — chosen specifically because the whole point of Stage 4b is
+raw-table grouping the fixed templates can't do:
+
+> Query: *"Group shipments by package type and show how many are delayed"*
+> Stage 4b drafted: `SELECT package_type, COUNT(*) AS delayed_count FROM shipments WHERE reason_for_delay <> 'NONE' GROUP BY package_type LIMIT 200;`
+> Stage 5: accepted (this exact aliased-column shape is what the `_select_aliases` fix above was for)
+> Stage 6: 6 rows, 40.7ms, real data from the seeded dataset
+> Stage 7 v1 answer: *"The number of delayed shipments for each package type is as follows: CRATE (977), CUSTOM (987), ENVELOPE (990), PALLET (974), TUBE (1011), and BOX (946)."* — confidence 1.0, plus two sensible follow-up suggestions.
+
+Regression-checked immediately after: all 6 v0 intents still resolve correctly and instantly via
+Stage 4a (a second live query correctly matched an existing template and never invoked the LLM
+at all — confirming the waterfall still prefers the free, deterministic path even with a working
+LLM provider configured), `/health` still passes, the DB guardrail still blocks writes, zero
+unexpected errors in logs.
+
+**Genuinely still open** (not blocking, but not exercised by the test runs so far):
+- Broader coverage across a wider range of real questions and result shapes than the ones tested
+  — each success below fixed exactly one demonstrated gap; more phrasings likely surface more.
+- Real latency and token/cost characteristics under production-like traffic (local inference in
+  particular varies a lot by hardware — successful runs above took well over a minute).
+- The Ollama tool-choice reliability gap is *mitigated* (explicit prompt instruction), not
+  *eliminated* — it's still possible for a local model to occasionally respond without calling
+  the tool even with the instruction present; the waterfall degrades this to v0's clarifying
+  answer rather than a crash, but it's a soft-failure rate worth monitoring, not zero.
+
+### Two more real bugs found via live testing (both fixed, both verified)
+
+**Bug: case-sensitivity mismatch produced a false "not found."** Query: *"How many
+international shipments are currently held in customs?"* Stage 4b correctly picked
+`v_domestic_vs_international` and drafted `WHERE shipment_scope = 'international'` — but the
+view's actual data is `'INTERNATIONAL'` (uppercase, from a `CASE WHEN...` expression). Postgres
+string comparison is case-sensitive, so this silently matched zero rows instead of erroring.
+Stage 7 correctly reported low confidence rather than fabricating a count — but the root cause
+was a real gap in what the model was shown: `describe_entities()` was silently dropping the
+schema JSON's `"grain"` field for views, which is exactly where this project already documents
+value casing (`"one row per shipment_scope (DOMESTIC/INTERNATIONAL)"`). Fixed by including
+`grain` in the view description block, plus a general "category/status values are UPPERCASE
+unless stated otherwise" rule added to Stage 4b's prompt as defense for columns without an
+explicit `grain` hint. Retested live: correct SQL, correct answer (510), confidence 1.0.
+
+**Gap: aggregate views structurally can't answer "give me N individual records."** Query:
+*"give me 5 shipments are currently held in customs?"* Stage 3's ranking put the raw `shipment`
+entity at #6 (0.404), just outside `top_k=4` — so Stage 4b was never shown a table it could list
+individual rows from, and correctly used the best of what it *was* given (the aggregate view,
+which only has a count column). Stage 7 again caught this honestly (0.3 confidence, "doesn't
+contain a list of five separate shipments") rather than inventing shipment IDs — but the
+underlying gap is structural, not a near-tie `top_k` can reliably catch: **"list N things" is a
+different signal than topical similarity, and no amount of embedding tuning captures it.**
+
+Fixed with a targeted, signal-based rule rather than another blanket `top_k` increase (see
+`schema_scope.py`'s `_wants_individual_records`): force the raw `shipment` entity into scope,
+independent of its ranking, whenever the query either (a) references a **specific identified
+thing** — a `tracking_id`, a fuzzy-matched customer name, or a fuzzy-matched city (new — mirrors
+the existing `org_name` cache pattern, querying distinct `src_loc`/`dest_loc` cities from the
+live data since there's no fixed enum to match against for free-text locations), or (b) uses
+**explicit list/enumeration phrasing** ("give me N", "list", "show me", "which shipments").
+Both signal "this needs one-row-per-record data" regardless of how the aggregate views score
+topically. The trace surfaces this via a new `forced_entities` field on `schema_scoped`, kept
+separate from the ranked entities so it's clear *why* something was included, not just that it
+was. Verified: correctly force-includes `shipment` for the failing query and stays inert for
+both a query where `shipment` was already naturally ranked (no redundant forcing) and a
+genuinely out-of-domain query (no false trigger). Retested live end-to-end: correct SQL against
+the raw table (`WHERE customs_status = 'HELD' LIMIT 5`), 5 real tracking IDs returned, all
+verified against the database, confidence 1.0. Full v0/v1 regression suite re-run clean after
+both fixes.
+
+## 10. Template library expansion: 6 → 20
+
+Audited the full schema (5 entities, 10 dashboard views) against what was actually templated and
+found the gap was large: only 2 of 10 dashboard views had a Stage 4a template pointing at them
+(`v_open_issues_summary`, `v_top_customers`), and every template was either a single-tracking-ID
+lookup or a zero-filter fleet aggregate — no template combined a filter with a JOIN, or filtered
+by anything other than `tracking_id`. Every other realistic question (by customer, by status, by
+package type, by delivery type) was silently falling through to Stage 4b every single time,
+paying LLM latency/cost for patterns common enough to deserve a zero-cost template.
+
+**Added 14 templates** (`sql_templates.py`, `respond_template.py`, and 14 new `query_patterns`
+entries in the schema JSON — Stage 1 needs an `example_nl` to route to each one, same as any
+other intent):
+
+- **8 zero-param, one per previously-unwired dashboard view**: `dashboard_headline`,
+  `status_breakdown`, `ontime_performance`, `delay_reason_breakdown`,
+  `domestic_vs_international_split`, `daily_volume_trend`, `service_level_mix`,
+  `chat_activity_summary`.
+- **6 mix-and-match, using entities Stage 2 already extracts**: `shipments_by_customer` and
+  `shipments_by_customer_delayed` (both genuine JOINs on `org_name` — the second is the exact
+  "which of this customer's shipments are delayed" case from the original raw-table-access
+  discussion in §8), `shipments_by_status`, `shipments_by_package_type`,
+  `shipments_by_delivery_type` (all filtered on a newly-fuzzy-matched enum field), and
+  `failed_delivery_shipments` (zero-param, `failed_delivery_attempts > 0`).
+
+`FilledTemplate`/`TemplateSpec` were generalized from a single `table_key: str` to
+`entity_keys: tuple/list` so JOIN templates (touching both `shipment` and `customer`) fit the
+same shape Stage 4b already needed for multi-entity scopes — no special-casing in `pipeline.py`
+or `guardrails.py` for "how many tables does this template touch."
+
+### Three real bugs found running all 20 live — none were in the new template SQL itself
+
+**1. Enum matching was completely non-functional from day one**, for every enum field, not just
+the new ones. Two independent, compounding bugs, both in `entities.py`:
+- `process.extractOne` is case-sensitive without an explicit `processor` — `"lost"` vs `"LOST"`
+  scored 0.0. Silently broken since the very first enum-matching code in this project, but
+  invisible until now because no earlier template ever gated on `enum_matches` as its *sole*
+  required entity.
+- The token regex `[A-Za-z][A-Za-z_ ]{2,}` allows spaces in the character class, so on any query
+  with no digits/punctuation to break it up, it greedily swallows the **entire query** into one
+  "token" — comparing a 30-character phrase against a 4-character candidate never scores close
+  to threshold. Fixed by replacing ad hoc tokenization with proper 1-to-3-word n-grams compared
+  via `fuzz.ratio` (whole-phrase similarity) against underscore-normalized candidates
+  (`"LOST_PACKAGE"` → `"lost package"`) — deliberately *not* `fuzz.partial_ratio` (substring
+  search) against the whole query, which was tried first and caused a different failure: "pallet
+  package shipments" scored 83 against `LOST_PACKAGE` purely because "package" is a literal
+  substring, with zero conceptual relation. `org_name`/`location` matching got the same
+  `processor` fix for consistency (case-insensitive company-name matching wasn't reliable
+  either, e.g. `"bass inc"` vs `"Bass Inc"` scored right at the threshold boundary — 80.0 exactly
+  — pure luck, not a designed margin).
+- One accepted, harmless side effect: short, morphologically-related words (`"delivery"` vs
+  `"DELIVERED"`) can produce a spurious match on an *unrelated* field (e.g. `current_status`
+  getting `DELIVERED` set alongside the correct `delivery_type=EXPRESS` for "express delivery
+  shipments"). Confirmed harmless: Stage 1 already independently classifies the correct intent
+  from the whole query, and each template's param builder only reads its own specific
+  `enum_matches` key — the noise sits unused.
+
+**2. The guardrail's alias handling didn't cover nested subqueries.** Surfaced fixing bug #3
+below: a two-subquery `FULL OUTER JOIN` rewrite was rejected as "unknown column: cnt" — `cnt`
+was a derived table's internal alias, and `_select_aliases` only scanned the outermost SELECT
+list. Fixed by walking every `exp.Select` in the tree (`tree.find_all(exp.Select)`), not just
+the top-level one. Same non-weakening argument as the original alias fix: an alias, at any
+nesting depth, can only ever refer to a value its own SELECT list already computed from
+already-checked real columns.
+
+**3. `v_daily_volume_trend` is a genuine performance trap** — ~12.7s against the seeded 25k-row
+dataset, reliably exceeding `agent_ro`'s `statement_timeout`, invisible until this session
+because nothing had ever actually queried it. Root cause: its `generate_series` spans the
+*entire* min-to-max date range in the data (not just "recently"), `LEFT JOIN`ing the full
+`shipments` table twice per day with a `created_at::date`/`delivery_date::date` join condition
+that can't use the existing (non-functional) indexes. Rather than risk a live view/DDL rewrite
+under time pressure (the immutable-index route needs the view's cast to match a
+timezone-fixed index expression exactly), the `daily_volume_trend` template was pointed at a
+bounded rewrite instead: two independently-filtered subqueries (`created_at >= CURRENT_DATE -
+14`, `delivery_date >= CURRENT_DATE - 14`), each a plain indexed range scan, combined with a
+`FULL OUTER JOIN`. Measured: **12.7s → 20ms.**
+
+That timeout is also what exposed a fourth, more general gap: **`executor.py` had no error
+handling at all.** A validated-safe query can still fail at runtime (this timeout is the
+demonstrated case, but a deadlock or any other transient DB error would do the same) — and
+because nothing caught it, `psycopg2.errors.QueryCanceled` propagated uncaught and crashed the
+SSE stream, the exact same failure shape as the audit-log foreign-key crash from the original
+corner-case audit (§9), just in a different stage. Fixed with the same pattern: a dedicated
+`ExecutionError` raised from `execute_query()`, caught in `pipeline.py` alongside the existing
+`GuardrailError` handling, degrading to a clean decline instead of crashing.
+
+### Verification
+
+All 20 templates checked against the real schema/guardrail locally (fast, no LLM) before any
+live test — 0 failures. Live-tested with paraphrased (not exact-copy) phrasings for all 20 —
+correct intent, `source: "template"`, correct SQL, correct final answer, cross-checked against
+the database for the enum-filtered and JOIN cases. Full regression re-run after every fix
+(corner-case audit's 4 scenarios, DB write guardrail, `/health`) — clean throughout. Backend
+error log: 7 unhandled exceptions during this round (all `QueryCanceled`, all from the same
+`daily_volume_trend` root cause) → 0 after the fix.
+
+## 11. The tracking_id default shortcut was over-eager — confirmed wrong answer, fixed
+
+Live query: *"what was the previous stage of 400000000154"*. Routing was correct end to end
+(low Stage 1 confidence, tracking_id extracted, bare-ID default fired) but the **answer was
+wrong**: the fixed `where_is_my_package` template always reports *current* status, so the
+response confidently stated the current stage while the question asked for the *previous* one
+— the actual answer (`AT_CONNECTING_HUB`, the entry before the current one) was sitting right
+there in the already-fetched `journey_timeline`, just never consulted, because the fallback
+that routed here doesn't know what was actually asked, only that a tracking_id was present.
+
+**Two shortcuts shared this root assumption**, both in `pipeline.py`, both keyed only on
+`extracted.tracking_id`:
+- The bare-ID default (`if resolved_intent is None and tracking_id: default to
+  where_is_my_package`).
+- The fleet-intent override guard (§9's corner-case audit fix — redirects a confidently-matched
+  fleet-wide intent to a shipment-scoped lookup when a tracking_id is present).
+
+Neither `org_name` nor `location` has an equivalent shortcut — an unmatched query mentioning
+either already fell straight through to Stage 4b before this fix, so nothing needed extending
+there; this was specifically a tracking_id-shortcut problem.
+
+**Fix:** `_is_minimal_query()` distinguishes "genuinely bare" (`"800000000131"`,
+`"wheres X"`) from "a real, specific question that happens to mention a tracking_id"
+(`"what was the previous stage of X"`) by word count after stripping the tracking_id(s) out —
+tuned to `<= 4` words specifically so it doesn't regress the two corner-case-audit queries that
+motivated the original shortcuts (`"tell me about shipment X"`, `"give me details about X"` —
+both exactly 4 words). Below the threshold, behavior is unchanged (instant, free, correct).
+Above it: the bare-ID default no longer fires at all (falls through to Stage 4b naturally,
+since `resolved_intent` stays `None`); the override guard clears the fleet-wide match instead
+of forcing a shipment-scoped one (`resolved_intent = None`), for the same reason — forcing
+*either* specific interpretation on a genuinely ambiguous, longer query is worse than letting
+Stage 4b (which already gets the right raw entity scoped in via Stage 3's identity forcing)
+decide from the real schema and the real question.
+
+Verified: all 4 previously-passing regression queries (2 per shortcut) unchanged. The bug query
+now correctly skips the default and reaches Stage 4b — confirmed via trace
+(`default_skipped_too_specific` → `llm_sql_fallback_attempting`). On this run, Stage 4b's LLM
+call itself didn't produce a usable query (Ollama's known no-forced-tool-choice reliability gap
+from §9, likely worsened by the ~300 requests/10min of concurrent load observed on this shared
+instance during testing) — but critically, **the failure mode is now an honest decline**
+(`"I can currently help with..."`), not a confident wrong answer. That's the actual fix: this
+change is about correctness of the *routing decision*, not a guarantee that Stage 4b's model
+call succeeds every time — that's the pre-existing, separately-documented reliability gap in
+§9, unaffected by and orthogonal to this fix. Full regression (all 20 templates' core paths,
+multi-ID guard, not-found handling, DB write guardrail, `/health`) re-run clean, 0 backend
+errors.
