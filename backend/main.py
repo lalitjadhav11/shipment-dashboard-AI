@@ -19,6 +19,9 @@ from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from chat.router import router as chat_router
+from chat import schema_loader
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres:postgres@db:5432/shipdb_phase1",
@@ -33,6 +36,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(chat_router)
+
+
+@app.on_event("startup")
+def _warm_up_chat_agent() -> None:
+    # Loads the embedding model + precomputes the intent/schema indexes once
+    # at startup, so the first /api/chat request isn't the one paying for it.
+    schema_loader.warm_up()
 
 
 @contextmanager

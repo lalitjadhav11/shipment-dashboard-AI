@@ -1,0 +1,336 @@
+{
+  "schema_name": "shipment_dashboard_phase1",
+  "version": "1.0.0",
+  "generated_for": "AI agent / LLM tool-use consumption (RAG + function-calling friendly)",
+  "description": "Agent-friendly JSON representation of the Phase 1 Shipment + Customer data model. Mirrors db/init/01_phase1_schema.sql and db/init/02_dashboard_summary_views.sql exactly (verified against the live DDL). Five tables (customers, shipments, tracking_events, shipment_issues, shipment_chat_log), one grounded-context view (v_shipment_journey_summary), and ten dashboard summary views. Each entity includes its table mapping, field definitions with datatypes/descriptions/sample values, relationships for graph traversal, and a fully linked sample record so an agent can reason about a real shipment lifecycle and write correct SQL without needing to inspect the DB first.",
+  "agent_context": {
+    "purpose": "Support the Phase 1 AI 'Shipment Journey Summary' chat feature: answer natural-language questions about a shipment's status and delay reason using a single grounded-context query, and generate dashboard KPI narration from the summary views.",
+    "recommended_agents": [
+      {
+        "agent_name": "shipment-journey-summary-agent",
+        "role": "Answer natural-language customer/support questions about a shipment ('where is it', 'why is it late') by calling v_shipment_journey_summary once per tracking_id and grounding the answer entirely in that payload.",
+        "primary_entities": ["shipment", "tracking_event", "shipment_issue", "customer"],
+        "primary_view": "v_shipment_journey_summary"
+      },
+      {
+        "agent_name": "dashboard-summarizer-agent",
+        "role": "Generate natural-language executive summaries and 'critical areas needing attention' highlights from the dashboard summary views (headline KPIs, open issues, delay-reason breakdown).",
+        "primary_entities": ["shipment", "shipment_issue"],
+        "primary_views": ["v_dashboard_headline", "v_open_issues_summary", "v_delay_reason_breakdown"]
+      }
+    ],
+    "governance": "Every chat interaction MUST be written to shipment_chat_log (user_query, ai_response, context_snapshot, confidence_score). confidence_score below 0.75 should be flagged for human support review — there is no separate governance/action-log table in Phase 1; shipment_chat_log is the sole audit trail.",
+    "query_patterns": [
+      {
+        "intent": "where_is_my_package",
+        "entities": ["shipment", "tracking_event"],
+        "recommended_query": "SELECT * FROM v_shipment_journey_summary WHERE tracking_id = $1;",
+        "example_nl": "Where is tracking number 794658312457 right now?"
+      },
+      {
+        "intent": "why_is_it_late",
+        "entities": ["shipment", "shipment_issue"],
+        "recommended_query": "SELECT * FROM v_shipment_journey_summary WHERE tracking_id = $1;  -- includes reason_for_delay, delay_comments, open_issue_count",
+        "example_nl": "Why is my shipment delayed?"
+      },
+      {
+        "intent": "customs_status",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT customs_status, is_international FROM shipments WHERE tracking_id = $1;",
+        "example_nl": "Is my international package stuck in customs?"
+      },
+      {
+        "intent": "open_issues_for_shipment",
+        "entities": ["shipment_issue"],
+        "recommended_query": "SELECT * FROM shipment_issues WHERE tracking_id = $1 AND status IN ('OPEN','INVESTIGATING') ORDER BY reported_at DESC;",
+        "example_nl": "Are there any open issues on this shipment?"
+      },
+      {
+        "intent": "ops_daily_briefing",
+        "entities": ["shipment_issue", "v_open_issues_summary", "v_dashboard_headline"],
+        "recommended_query": "SELECT * FROM v_dashboard_headline; SELECT * FROM v_open_issues_summary WHERE status = 'OPEN' ORDER BY issue_count DESC;",
+        "example_nl": "Give me today's critical shipment issues."
+      },
+      {
+        "intent": "top_customers_by_volume",
+        "entities": ["customer", "shipment"],
+        "recommended_query": "SELECT * FROM v_top_customers;",
+        "example_nl": "Who are our top shippers and how's their on-time rate?"
+      }
+    ]
+  },
+  "lifecycle_state_machine": {
+    "entity": "shipments.current_status",
+    "shared_enum": "shipment_status_enum (also used by tracking_events.stage)",
+    "states_in_order": [
+      "LABEL_CREATED",
+      "SHIPMENT_CREATED",
+      "PACKAGE_RECEIVED",
+      "TRACKING_ID_ISSUED",
+      "IN_TRANSIT_TO_ORIGIN_HUB",
+      "AT_DISTRIBUTION_HUB",
+      "IN_TRANSIT",
+      "AT_CONNECTING_HUB",
+      "CUSTOMS_HOLD",
+      "CUSTOMS_CLEARED",
+      "IN_TRANSIT_TO_DESTINATION_HUB",
+      "OUT_FOR_DELIVERY",
+      "DELIVERED"
+    ],
+    "terminal_failure_states": [
+      "DELIVERY_FAILED",
+      "RETURNED_TO_SENDER",
+      "LOST",
+      "CANCELLED"
+    ],
+    "notes": "CUSTOMS_HOLD / CUSTOMS_CLEARED apply only when shipments.is_international = true, as a sub-stage of the connecting hub. Every transition (and the initial insert) is auto-logged to tracking_events via the trg_shipments_stage_history DB trigger, so tracking_events is always a complete timeline — no manual event-writing needed by agents."
+  },
+  "entities": {
+    "customer": {
+      "table": "customers",
+      "primary_key": "customer_id",
+      "description": "The organization/account holder. One customer can have many shipments.",
+      "fields": {
+        "customer_id": { "datatype": "UUID", "description": "Primary key, auto-generated", "sample_value": "11111111-1111-1111-1111-111111111111", "nullable": false },
+        "fedex_account_id": { "datatype": "VARCHAR(30)", "description": "Carrier billing/loyalty account number, unique", "sample_value": "ACCT-88213", "nullable": false },
+        "org_name": { "datatype": "VARCHAR(200)", "description": "Organization display name", "sample_value": "Acme Corp", "nullable": false },
+        "customer_profile": { "datatype": "JSONB", "description": "Flexible profile blob: contact_name, email, phone, tier, etc.", "sample_value": { "tier": "GOLD", "email": "jane@acme.com" }, "nullable": false },
+        "is_active": { "datatype": "BOOLEAN", "description": "Account active flag", "sample_value": true, "nullable": false },
+        "created_at": { "datatype": "TIMESTAMPTZ", "description": "Row creation time", "sample_value": "2025-01-10T09:00:00Z", "nullable": false },
+        "updated_at": { "datatype": "TIMESTAMPTZ", "description": "Auto-updated by trg_customers_updated_at on every UPDATE", "sample_value": "2025-01-10T09:00:00Z", "nullable": false }
+      },
+      "relationships": [
+        { "to": "shipment", "type": "one_to_many", "via": "shipments.customer_id -> customers.customer_id" },
+        { "to": "shipment_chat_log", "type": "one_to_many", "via": "shipment_chat_log.customer_id -> customers.customer_id (nullable FK)" }
+      ]
+    },
+    "shipment": {
+      "table": "shipments",
+      "primary_key": "tracking_id",
+      "description": "CORE ENTITY. Tracking-ID-centric shipment record. Package, customs, pickup, and delivery-appointment detail are folded directly into this table (no separate packages/customs_declarations/pickup_requests/delivery_appointments tables in Phase 1) to minimize joins for the chat agent's context query. Use this raw table (not a view) for ad-hoc grouping, filtering, counting, or breakdown questions by package_type, package_size, package_weight_kg, delivery_type, pickup_date, delivery_window, or failed_delivery_attempts — none of the dashboard views pre-aggregate by these package/logistics attributes, only by status, delay reason, or customer.",
+      "fields": {
+        "tracking_id": { "datatype": "VARCHAR(40)", "description": "Primary key — public tracking number. NOT a UUID; this is the stable externally-visible identifier.", "sample_value": "794658312457", "nullable": false },
+        "order_id": { "datatype": "VARCHAR(50)", "description": "External order-system reference; order management is out of Phase 1 scope", "sample_value": "ORD-2026-0000001", "nullable": true },
+        "customer_id": { "datatype": "UUID", "description": "FK to customers", "sample_value": "11111111-1111-1111-1111-111111111111", "nullable": false },
+        "package_type": { "datatype": "ENUM package_type_enum", "description": "Packaging form factor", "sample_value": "BOX", "nullable": false, "allowed_values": ["BOX", "ENVELOPE", "TUBE", "CRATE", "PALLET", "CUSTOM"] },
+        "package_desc": { "datatype": "VARCHAR(255)", "description": "Human description of contents", "sample_value": "Wireless headphones", "nullable": true },
+        "package_size": { "datatype": "ENUM package_size_enum", "description": "Size bucket", "sample_value": "SMALL", "nullable": false, "allowed_values": ["SMALL", "MEDIUM", "LARGE", "EXTRA_LARGE", "PALLET_SIZED"] },
+        "package_weight_kg": { "datatype": "NUMERIC(10,3)", "description": "Package weight", "sample_value": 2.5, "nullable": true },
+        "delivery_type": { "datatype": "ENUM delivery_type_enum", "description": "Service level", "sample_value": "INTERNATIONAL_PRIORITY", "nullable": false, "allowed_values": ["STANDARD", "EXPRESS", "OVERNIGHT", "ECONOMY", "INTERNATIONAL_PRIORITY"] },
+        "is_international": { "datatype": "BOOLEAN", "description": "Drives customs sub-stages (CUSTOMS_HOLD/CUSTOMS_CLEARED)", "sample_value": true, "nullable": false },
+        "src_loc": { "datatype": "JSONB", "description": "Origin location: {address, city, country_code}", "sample_value": { "city": "San Francisco", "country_code": "US" }, "nullable": false },
+        "dest_loc": { "datatype": "JSONB", "description": "Destination location: {address, city, country_code}", "sample_value": { "city": "Berlin", "country_code": "DE" }, "nullable": false },
+        "customs_status": { "datatype": "ENUM customs_status_enum", "description": "Customs clearance state, folded in from the deferred customs_declarations concept", "sample_value": "PENDING", "nullable": false, "allowed_values": ["NOT_REQUIRED", "PENDING", "HELD", "CLEARED", "REJECTED"] },
+        "pickup_date": { "datatype": "DATE", "description": "Folded-in pickup scheduling", "sample_value": "2026-07-17", "nullable": true },
+        "pickup_window_start": { "datatype": "TIME", "description": "Pickup window start", "sample_value": "09:00:00", "nullable": true },
+        "pickup_window_end": { "datatype": "TIME", "description": "Pickup window end", "sample_value": "17:00:00", "nullable": true },
+        "delivery_window_start": { "datatype": "TIMESTAMPTZ", "description": "Folded-in delivery appointment window start", "sample_value": null, "nullable": true },
+        "delivery_window_end": { "datatype": "TIMESTAMPTZ", "description": "Folded-in delivery appointment window end", "sample_value": null, "nullable": true },
+        "current_status": { "datatype": "ENUM shipment_status_enum", "description": "Authoritative journey stage — see lifecycle_state_machine. Auto-logs to tracking_events via trigger on every change.", "sample_value": "CUSTOMS_HOLD", "nullable": false, "default": "LABEL_CREATED" },
+        "estimated_delivery": { "datatype": "TIMESTAMPTZ", "description": "ETA", "sample_value": "2026-07-19T18:00:00Z", "nullable": true },
+        "delivery_date": { "datatype": "TIMESTAMPTZ", "description": "Actual delivery timestamp, null until DELIVERED", "sample_value": null, "nullable": true },
+        "reason_for_delay": { "datatype": "ENUM reason_for_delay_enum", "description": "Root cause category when delayed", "sample_value": "CUSTOMS", "nullable": false, "default": "NONE", "allowed_values": ["NONE", "CUSTOMS", "WEATHER", "CIVIL_UNREST", "LOST_PACKAGE", "MECHANICAL_ISSUE", "ADDRESS_ISSUE", "OTHER"] },
+        "delay_comments": { "datatype": "TEXT", "description": "Free-text delay explanation", "sample_value": "Missing HS code; awaiting broker resubmission.", "nullable": true },
+        "failed_delivery_attempts": { "datatype": "SMALLINT", "description": "Attempt count", "sample_value": 0, "nullable": false, "default": 0 },
+        "last_delivery_attempt_at": { "datatype": "TIMESTAMPTZ", "description": "Timestamp of most recent delivery attempt", "sample_value": null, "nullable": true },
+        "comments": { "datatype": "TEXT", "description": "General free-text notes", "sample_value": null, "nullable": true },
+        "created_at": { "datatype": "TIMESTAMPTZ", "description": "Row creation time", "sample_value": "2026-07-15T08:00:00Z", "nullable": false },
+        "updated_at": { "datatype": "TIMESTAMPTZ", "description": "Auto-updated by trg_shipments_updated_at on every UPDATE", "sample_value": "2026-07-18T04:00:00Z", "nullable": false }
+      },
+      "relationships": [
+        { "to": "customer", "type": "many_to_one", "via": "shipments.customer_id -> customers.customer_id" },
+        { "to": "tracking_event", "type": "one_to_many", "via": "tracking_events.tracking_id -> shipments.tracking_id" },
+        { "to": "shipment_issue", "type": "one_to_many", "via": "shipment_issues.tracking_id -> shipments.tracking_id" },
+        { "to": "shipment_chat_log", "type": "one_to_many", "via": "shipment_chat_log.tracking_id -> shipments.tracking_id (nullable FK)" }
+      ]
+    },
+    "tracking_event": {
+      "table": "tracking_events",
+      "primary_key": "event_id",
+      "description": "Append-only journey log — one row per stage transition. Auto-logged by the trg_shipments_stage_history DB trigger whenever shipments.current_status changes (and on insert); this is the primary context source for the AI chat's journey_timeline.",
+      "fields": {
+        "event_id": { "datatype": "UUID", "description": "Primary key, auto-generated", "sample_value": "7a7a7a7a-0000-0000-0000-000000000001", "nullable": false },
+        "tracking_id": { "datatype": "VARCHAR(40)", "description": "FK to shipments, ON DELETE CASCADE", "sample_value": "794658312457", "nullable": false },
+        "stage": { "datatype": "ENUM shipment_status_enum", "description": "Journey stage recorded at this event — same enum as shipments.current_status", "sample_value": "AT_CONNECTING_HUB", "nullable": false },
+        "location": { "datatype": "VARCHAR(200)", "description": "Human-readable location, nullable", "sample_value": "Frankfurt Hub, DE", "nullable": true },
+        "event_timestamp": { "datatype": "TIMESTAMPTZ", "description": "When the transition occurred", "sample_value": "2026-07-18T04:00:00Z", "nullable": false },
+        "notes": { "datatype": "TEXT", "description": "Nullable; auto-trigger writes 'Auto-logged on status change'", "sample_value": "Auto-logged on status change", "nullable": true }
+      },
+      "relationships": [
+        { "to": "shipment", "type": "many_to_one", "via": "tracking_events.tracking_id -> shipments.tracking_id" }
+      ]
+    },
+    "shipment_issue": {
+      "table": "shipment_issues",
+      "primary_key": "issue_id",
+      "description": "One row per delay/failed-delivery/RCA incident — the 'check existing issue details' requirement. Looked up by the AI chat agent and by ops before opening a duplicate. Lighter replacement for the deferred full shipment_exceptions RCA ledger.",
+      "fields": {
+        "issue_id": { "datatype": "UUID", "description": "Primary key, auto-generated", "sample_value": "9c9c9c9c-0000-0000-0000-000000000001", "nullable": false },
+        "tracking_id": { "datatype": "VARCHAR(40)", "description": "FK to shipments, ON DELETE CASCADE", "sample_value": "794658312457", "nullable": false },
+        "issue_type": { "datatype": "ENUM issue_type_enum", "description": "Category of incident", "sample_value": "CUSTOMS_HOLD", "nullable": false, "allowed_values": ["CUSTOMS_HOLD", "WEATHER_DELAY", "CIVIL_UNREST", "LOST_PACKAGE", "FAILED_DELIVERY_ATTEMPT", "ADDRESS_ISSUE", "OTHER"] },
+        "description": { "datatype": "TEXT", "description": "What happened", "sample_value": "Missing HS code on declaration; awaiting broker resubmission.", "nullable": true },
+        "status": { "datatype": "ENUM issue_status_enum", "description": "Resolution status", "sample_value": "OPEN", "nullable": false, "default": "OPEN", "allowed_values": ["OPEN", "INVESTIGATING", "RESOLVED", "CLOSED"] },
+        "reported_at": { "datatype": "TIMESTAMPTZ", "description": "When reported", "sample_value": "2026-07-18T04:05:00Z", "nullable": false },
+        "resolved_at": { "datatype": "TIMESTAMPTZ", "description": "Nullable until resolved", "sample_value": null, "nullable": true }
+      },
+      "relationships": [
+        { "to": "shipment", "type": "many_to_one", "via": "shipment_issues.tracking_id -> shipments.tracking_id" }
+      ]
+    },
+    "shipment_chat_log": {
+      "table": "shipment_chat_log",
+      "primary_key": "chat_id",
+      "description": "Audit log of every AI chat interaction — question, grounded context used, generated answer, and confidence score — enabling QA review of the Phase 1 journey-summary chat feature. This is the ONLY agent-governance mechanism in Phase 1 (no separate agent_action_log).",
+      "fields": {
+        "chat_id": { "datatype": "UUID", "description": "Primary key, auto-generated", "sample_value": "cdcd1111-0000-0000-0000-000000000001", "nullable": false },
+        "tracking_id": { "datatype": "VARCHAR(40)", "description": "FK to shipments, nullable for general queries, ON DELETE SET NULL", "sample_value": "794658312457", "nullable": true },
+        "customer_id": { "datatype": "UUID", "description": "FK to customers, nullable, ON DELETE SET NULL", "sample_value": "11111111-1111-1111-1111-111111111111", "nullable": true },
+        "user_query": { "datatype": "TEXT", "description": "The question asked", "sample_value": "Why is my package delayed?", "nullable": false },
+        "ai_response": { "datatype": "TEXT", "description": "The generated answer", "sample_value": "Your package is currently held at customs in Frankfurt due to a missing HS code on the declaration...", "nullable": false },
+        "context_snapshot": { "datatype": "JSONB", "description": "Full grounded context used, i.e. the v_shipment_journey_summary row at answer time", "sample_value": { "current_status": "CUSTOMS_HOLD" }, "nullable": true },
+        "confidence_score": { "datatype": "NUMERIC(5,4)", "description": "0-1; below 0.75 should be flagged for human review", "sample_value": 0.91, "nullable": true },
+        "created_at": { "datatype": "TIMESTAMPTZ", "description": "When the interaction occurred", "sample_value": "2026-07-18T09:15:00Z", "nullable": false }
+      },
+      "relationships": [
+        { "to": "shipment", "type": "many_to_one", "via": "shipment_chat_log.tracking_id -> shipments.tracking_id" },
+        { "to": "customer", "type": "many_to_one", "via": "shipment_chat_log.customer_id -> customers.customer_id" }
+      ]
+    }
+  },
+  "views": {
+    "v_shipment_journey_summary": {
+      "defined_in": "db/init/01_phase1_schema.sql",
+      "purpose": "Single grounded-context payload for the AI Shipment Journey Summary chat. Call once per tracking_id instead of joining tables manually.",
+      "grain": "one row per tracking_id",
+      "recommended_query": "SELECT * FROM v_shipment_journey_summary WHERE tracking_id = $1;",
+      "columns": ["tracking_id", "order_id", "customer_id", "org_name", "current_status", "is_international", "customs_status", "delivery_type", "estimated_delivery", "delivery_date", "reason_for_delay", "delay_comments", "src_loc", "dest_loc", "open_issue_count", "journey_timeline (JSONB array of {stage, location, event_timestamp, notes}, ordered by event_timestamp)"]
+    },
+    "v_dashboard_headline": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "One-row headline snapshot for the top of the dashboard — 10 KPIs, one query. Backs GET /api/summary.",
+      "grain": "single row",
+      "columns": ["total_shipments", "total_customers", "delivered_count", "on_time_pct", "in_transit_overdue", "open_issues", "international_shipments", "customs_held_now", "lost_count", "returned_count", "cancelled_count", "generated_at"],
+      "sample_row": { "total_shipments": 25000, "total_customers": 800, "delivered_count": 14000, "on_time_pct": 75.0, "in_transit_overdue": 6550, "open_issues": 2185, "international_shipments": 5704, "customs_held_now": 600, "lost_count": 100, "returned_count": 200, "cancelled_count": 200 }
+    },
+    "v_status_breakdown": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "Counts + share of total by current_status. Backs GET /api/status-breakdown.",
+      "grain": "one row per current_status",
+      "columns": ["current_status", "shipment_count", "pct_of_total"]
+    },
+    "v_ontime_performance": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "On-time delivery performance for shipments that have a verdict (delivered or overdue-in-transit).",
+      "grain": "single row",
+      "columns": ["delivered_count", "delivered_on_time", "delivered_late", "on_time_pct", "avg_delay_hours_when_late", "in_transit_overdue"]
+    },
+    "v_delay_reason_breakdown": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "Breakdown of delayed shipments by reason_for_delay (excludes NONE).",
+      "grain": "one row per reason_for_delay",
+      "columns": ["reason_for_delay", "shipment_count", "pct_of_delayed"]
+    },
+    "v_open_issues_summary": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "The dashboard 'critical areas needing attention' widget.",
+      "grain": "one row per (issue_type, status)",
+      "columns": ["issue_type", "status", "issue_count", "avg_age_or_resolution_hours"]
+    },
+    "v_domestic_vs_international": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "Domestic vs international split plus a customs-status snapshot.",
+      "grain": "one row per shipment_scope (DOMESTIC/INTERNATIONAL)",
+      "columns": ["shipment_scope", "shipment_count", "customs_held", "customs_pending", "customs_cleared"]
+    },
+    "v_daily_volume_trend": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "Created vs delivered shipment volume per calendar day across the full date range in the data.",
+      "grain": "one row per day",
+      "columns": ["day", "shipments_created", "shipments_delivered"]
+    },
+    "v_service_level_mix": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "Shipment volume and on-time % by delivery_type (service level).",
+      "grain": "one row per delivery_type",
+      "columns": ["delivery_type", "shipment_count", "on_time_pct"]
+    },
+    "v_top_customers": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "Top 25 customers by shipment volume, with their own on-time rate.",
+      "grain": "one row per customer, limit 25",
+      "columns": ["org_name", "fedex_account_id", "shipment_count", "delivered_count", "on_time_pct"]
+    },
+    "v_chat_activity_summary": {
+      "defined_in": "db/init/02_dashboard_summary_views.sql",
+      "purpose": "AI chat feature usage snapshot — volume, average confidence, and low-confidence count needing review.",
+      "grain": "single row",
+      "columns": ["total_chat_interactions", "shipments_with_chat", "avg_confidence", "low_confidence_needing_review"]
+    }
+  },
+  "sample_linked_dataset": {
+    "narrative": "Acme Corp ships wireless headphones internationally from San Francisco to Berlin. The shipment is held at customs in Frankfurt due to a missing HS code, generating an open shipment_issue. A customer support agent asks the AI chat why the package is delayed; the chat agent answers using v_shipment_journey_summary and logs the interaction.",
+    "customer": {
+      "customer_id": "11111111-1111-1111-1111-111111111111",
+      "fedex_account_id": "ACCT-88213",
+      "org_name": "Acme Corp",
+      "customer_profile": { "tier": "GOLD", "email": "jane@acme.com" },
+      "is_active": true
+    },
+    "shipment": {
+      "tracking_id": "794658312457",
+      "order_id": "ORD-2026-0000001",
+      "customer_id": "11111111-1111-1111-1111-111111111111",
+      "package_type": "BOX",
+      "package_desc": "Wireless headphones",
+      "package_size": "SMALL",
+      "package_weight_kg": 2.5,
+      "delivery_type": "INTERNATIONAL_PRIORITY",
+      "is_international": true,
+      "src_loc": { "city": "San Francisco", "country_code": "US" },
+      "dest_loc": { "city": "Berlin", "country_code": "DE" },
+      "customs_status": "PENDING",
+      "current_status": "CUSTOMS_HOLD",
+      "estimated_delivery": "2026-07-19T18:00:00Z",
+      "delivery_date": null,
+      "reason_for_delay": "CUSTOMS",
+      "delay_comments": "Missing HS code; awaiting broker resubmission."
+    },
+    "tracking_timeline": [
+      { "stage": "LABEL_CREATED", "event_timestamp": "2026-07-15T08:00:00Z", "location": "San Francisco, CA, US" },
+      { "stage": "SHIPMENT_CREATED", "event_timestamp": "2026-07-15T08:05:00Z", "location": "San Francisco, CA, US" },
+      { "stage": "PACKAGE_RECEIVED", "event_timestamp": "2026-07-16T10:00:00Z", "location": "San Francisco, CA, US" },
+      { "stage": "TRACKING_ID_ISSUED", "event_timestamp": "2026-07-16T10:01:00Z", "location": "San Francisco, CA, US" },
+      { "stage": "IN_TRANSIT_TO_ORIGIN_HUB", "event_timestamp": "2026-07-16T14:00:00Z", "location": "Oakland, CA, US" },
+      { "stage": "AT_DISTRIBUTION_HUB", "event_timestamp": "2026-07-16T20:00:00Z", "location": "Oakland Hub, CA, US" },
+      { "stage": "IN_TRANSIT", "event_timestamp": "2026-07-17T02:00:00Z", "location": "In flight to Frankfurt" },
+      { "stage": "AT_CONNECTING_HUB", "event_timestamp": "2026-07-18T03:00:00Z", "location": "Frankfurt Hub, DE" },
+      { "stage": "CUSTOMS_HOLD", "event_timestamp": "2026-07-18T04:00:00Z", "location": "Frankfurt Hub, DE" }
+    ],
+    "shipment_issue": {
+      "issue_id": "9c9c9c9c-0000-0000-0000-000000000001",
+      "tracking_id": "794658312457",
+      "issue_type": "CUSTOMS_HOLD",
+      "description": "Missing HS code on declaration; awaiting broker resubmission.",
+      "status": "OPEN",
+      "reported_at": "2026-07-18T04:05:00Z",
+      "resolved_at": null
+    },
+    "grounded_context_from_view": {
+      "view": "v_shipment_journey_summary",
+      "current_status": "CUSTOMS_HOLD",
+      "is_international": true,
+      "customs_status": "PENDING",
+      "reason_for_delay": "CUSTOMS",
+      "open_issue_count": 1,
+      "journey_timeline_stage_count": 9
+    },
+    "shipment_chat_log": {
+      "chat_id": "cdcd1111-0000-0000-0000-000000000001",
+      "tracking_id": "794658312457",
+      "customer_id": "11111111-1111-1111-1111-111111111111",
+      "user_query": "Why is my package delayed?",
+      "ai_response": "Your package is currently held at customs in Frankfurt due to a missing HS code on the declaration. The broker has been notified and it should clear within 24 hours. Estimated delivery is now July 19, 6:00 PM local time, pending clearance.",
+      "confidence_score": 0.91
+    }
+  }
+}

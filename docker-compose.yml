@@ -18,8 +18,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-shipdb_phase1}
-    # Schema (01) + dashboard views (02) run automatically, in filename order,
-    # the first time the data volume is empty.
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:-agent_ro_pw}
+    # Schema (01) + dashboard views (02) + read-only agent role (03) run
+    # automatically, in filename order, the first time the data volume is empty.
     volumes:
       - ./db/init:/docker-entrypoint-initdb.d:ro
       - pgdata:/var/lib/postgresql/data
@@ -50,9 +51,19 @@ services:
     container_name: shipment_backend
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-shipdb_phase1}
+      # Read-only role for the AI chat agent — see AGENTIC_RAG_ARCHITECTURE.md §4 Stage 5/6.
+      AGENT_DATABASE_URL: postgresql://agent_ro:${AGENT_DB_PASSWORD:-agent_ro_pw}@db:5432/${POSTGRES_DB:-shipdb_phase1}
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      # Single source of truth for the agent's schema knowledge — mounted
+      # read-only rather than copied at build time, so it can be edited
+      # without rebuilding the backend image (see 02_phase1_agentic_schema.json).
+      - ./02_phase1_agentic_schema.json:/app/schema/02_phase1_agentic_schema.json:ro
+      # Persists the sentence-transformers model download across container
+      # restarts / rebuilds so it isn't re-fetched from HuggingFace every time.
+      - hf_cache:/root/.cache/huggingface
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -68,3 +79,4 @@ services:
 
 volumes:
   pgdata:
+  hf_cache:
