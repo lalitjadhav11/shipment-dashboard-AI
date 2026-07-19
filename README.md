@@ -34,10 +34,10 @@ for the full stage reference, the AI chat's grounded-context design
 | 5-table schema, enums, triggers, `v_shipment_journey_summary` view   | ✅ Done (`db/init/01_phase1_schema.sql`) |
 | 10 dashboard summary views (headline KPIs, breakdowns, trends)       | ✅ Done (`db/init/02_dashboard_summary_views.sql`) |
 | Scenario-based data generator (25k shipments / 800 customers)        | ✅ Done (`03_generate_phase1_data.py`, run by the `seeder` service) |
-| Backend API (FastAPI) — hello world, health check, KPI reads         | ✅ Done, boilerplate (`backend/main.py`) |
-| Frontend (React) — hello world screen, pings backend                 | ✅ Done, boilerplate (`frontend/src`) |
+| Backend API (FastAPI) — hello world, health check, KPI reads, paginated shipment listing | ✅ Done (`backend/main.py`) |
+| Frontend (React) — reporting dashboard: KPI row + searchable/filterable/paginated shipment table | ✅ Done (`frontend/src`) |
+| Shipment detail drawer — click a tracking ID for status, customs, delay info, and a Google Maps journey view (stops + flight/truck legs) | ✅ Done (`frontend/src/components/ShipmentDetailDrawer.jsx`, `JourneyMap.jsx`) |
 | **AI Shipment Journey Summary chat** (the feature the schema supports) | ⏳ Not yet implemented — `shipment_chat_log` and `v_shipment_journey_summary` are in place to support it |
-| Real dashboard UI (charts/tables over the 10 summary views)          | ⏳ Not yet implemented |
 
 ## Architecture
 
@@ -65,10 +65,11 @@ docker compose up --build
 
 Then open:
 
-- **Frontend (Hello World):** http://localhost:3000
+- **Frontend (reporting dashboard):** http://localhost:3000
 - **Backend API root:** http://localhost:8000
 - **API docs (Swagger):** http://localhost:8000/docs
 - **Headline KPIs:** http://localhost:8000/api/summary
+- **Paginated shipments:** http://localhost:8000/api/shipments?page=1&page_size=50
 
 The first boot takes a few minutes because the seeder generates and loads the
 full **25,000-shipment** dataset. Watch progress with:
@@ -124,7 +125,7 @@ stack to another machine.
 └── frontend/
     ├── Dockerfile                  # multi-stage: Vite build -> nginx
     ├── nginx.conf                  # serves SPA, proxies /api -> backend
-    └── src/                        # React Hello World screen
+    └── src/                        # React reporting dashboard (KPI row + shipment table)
 ```
 
 ## Backend endpoints
@@ -136,6 +137,8 @@ stack to another machine.
 | GET    | `/health`               | Liveness + DB connectivity                |
 | GET    | `/api/summary`          | `v_dashboard_headline` — 10 KPIs          |
 | GET    | `/api/status-breakdown` | `v_status_breakdown`                      |
+| GET    | `/api/shipments`        | Paginated shipment listing — `page`, `page_size` (default 50), `search`, `status`, `delivery_type`, `is_international`, `customs_status`, `sort_by`, `sort_dir` |
+| GET    | `/api/shipments/{tracking_id}` | `v_shipment_journey_summary` for one shipment — status, customs, delay, open issues, full journey timeline. Backs the detail drawer + journey map. |
 
 ## Configuration
 
@@ -149,3 +152,4 @@ All settings have defaults; override by copying `.env.example` to `.env`:
 | `SEED_SHIPMENTS`    | `25000`         | Rows to generate (lower = faster dev)  |
 | `SEED_CUSTOMERS`    | `800`           | Customer count                         |
 | `SEED_RANDOM_SEED`  | `42`            | Deterministic generation seed          |
+| `VITE_GOOGLE_MAPS_API_KEY` | *(empty)* | Google Maps JavaScript API key for the shipment detail drawer's journey map. Without it, the drawer shows a "map disabled" placeholder instead of erroring. Baked into the static frontend build at image-build time — rebuild the frontend after changing it (`docker compose up --build frontend`). |
