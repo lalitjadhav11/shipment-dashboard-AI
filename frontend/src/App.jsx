@@ -1,28 +1,37 @@
 import { useEffect, useState } from "react";
-
-// The nginx image proxies /api to the backend container (see nginx.conf),
-// so a relative path works both in the browser and inside Docker.
-const API_BASE = import.meta.env.VITE_API_BASE ?? "";
+import TopBar from "./components/TopBar.jsx";
+import SideBar from "./components/SideBar.jsx";
+import KpiRow from "./components/KpiRow.jsx";
+import ShipmentsTable from "./components/ShipmentsTable.jsx";
+import { fetchSummary } from "./api.js";
 
 export default function App() {
-  const [backend, setBackend] = useState(null);
-  const [error, setError] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(true);
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/hello`)
-      .then((r) => r.json())
-      .then((data) => setBackend(data.message))
-      .catch((e) => setError(String(e)));
+    fetchSummary()
+      .then(setSummary)
+      .finally(() => setSummaryLoading(false));
   }, []);
 
   return (
-    <div className="card">
-      <h1>Hello World 👋</h1>
-      <p>Shipment Dashboard — Phase 1</p>
-      <p>React frontend is up and running.</p>
+    <div className="app-shell">
+      <TopBar />
+      <div className="app-body">
+        <SideBar />
+        <main className="app-main">
+          <div className="page-header">
+            <div>
+              <h1>Shipment reporting</h1>
+              <p>Real-time visibility into every shipment across your account</p>
+            </div>
+          </div>
 
-      {backend && <div className="status ok">backend says: {backend}</div>}
-      {error && <div className="status err">backend not reachable yet…</div>}
+          <KpiRow summary={summary} loading={summaryLoading} />
+          <ShipmentsTable />
+        </main>
+      </div>
     </div>
   );
 }

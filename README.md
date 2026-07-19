@@ -39,6 +39,10 @@ for the full stage reference, the AI chat's grounded-context design
 | **AI Shipment Journey Summary chat — v0** (deterministic, zero-LLM backbone) | ✅ Done (`backend/chat/`) — intent classification, entity extraction, schema scoping, template SQL, guardrail validation, and response formatting all run without an LLM call. **20 templates** covering every dashboard view plus mix-and-match filters (by customer, status, package type, delivery type). See [`AGENTIC_RAG_ARCHITECTURE.md`](AGENTIC_RAG_ARCHITECTURE.md) §10 |
 | **AI chat v1** (LLM SQL fallback + LLM response synthesis) | ✅ Done and **live-verified end-to-end** with a local Ollama model — a genuine `GROUP BY` question ("group shipments by package type and show how many are delayed") got a correctly-drafted query, guardrail-validated, executed, and synthesized into a natural-language answer with follow-up suggestions. Supports two interchangeable providers via `AGENT_LLM_PROVIDER` — `anthropic` (cloud) or `ollama` (local, no API cost) — switching is one env var, no code change. See `AGENTIC_RAG_ARCHITECTURE.md` §9 |
 | Real dashboard UI (charts/tables over the 10 summary views)          | ⏳ Not yet implemented |
+| Backend API (FastAPI) — hello world, health check, KPI reads, paginated shipment listing | ✅ Done (`backend/main.py`) |
+| Frontend (React) — reporting dashboard: KPI row + searchable/filterable/paginated shipment table | ✅ Done (`frontend/src`) |
+| Shipment detail drawer — click a tracking ID for status, customs, delay info, and a Google Maps journey view (stops + flight/truck legs) | ✅ Done (`frontend/src/components/ShipmentDetailDrawer.jsx`, `JourneyMap.jsx`) |
+| **AI Shipment Journey Summary chat** (the feature the schema supports) | ⏳ Not yet implemented — `shipment_chat_log` and `v_shipment_journey_summary` are in place to support it |
 
 ## Architecture
 
@@ -66,10 +70,11 @@ docker compose up --build
 
 Then open:
 
-- **Frontend (Hello World):** http://localhost:3000
+- **Frontend (reporting dashboard):** http://localhost:3000
 - **Backend API root:** http://localhost:8000
 - **API docs (Swagger):** http://localhost:8000/docs
 - **Headline KPIs:** http://localhost:8000/api/summary
+- **Paginated shipments:** http://localhost:8000/api/shipments?page=1&page_size=50
 
 The first boot takes a few minutes because the seeder generates and loads the
 full **25,000-shipment** dataset. Watch progress with:
@@ -138,7 +143,7 @@ stack to another machine.
 └── frontend/
     ├── Dockerfile                  # multi-stage: Vite build -> nginx
     ├── nginx.conf                  # serves SPA, proxies /api -> backend
-    └── src/                        # React Hello World screen
+    └── src/                        # React reporting dashboard (KPI row + shipment table)
 ```
 
 ## Backend endpoints
@@ -153,6 +158,10 @@ stack to another machine.
 | POST   | `/api/chat`              | AI Shipment Journey Summary chat — streams Server-Sent Events, one per pipeline stage, ending with `answer_ready`. Send `{"query": "..."}`. Falls back to Stage 4b (LLM) when no template matches, if `ANTHROPIC_API_KEY` is set — see status table above. |
 | GET    | `/api/chat/history`      | Read `shipment_chat_log` for QA (optional `?tracking_id=`) |
 
+| GET    | `/api/shipments`        | Paginated shipment listing — `page`, `page_size` (default 50), `search`, `status`, `delivery_type`, `is_international`, `customs_status`, `sort_by`, `sort_dir` |
+| GET    | `/api/shipments/{tracking_id}` | `v_shipment_journey_summary` for one shipment — status, customs, delay, open issues, full journey timeline. Backs the detail drawer + journey map. |
+
+
 `/api/chat`'s intermediate "thinking" trace (intent, extracted entities, scoped
 schema, generated SQL, validation, execution) is a **privilege**, gated by an
 `X-User-Role` header (`SUPPORT`/`OPS`/`ADMIN`) — this header is a placeholder
@@ -164,7 +173,6 @@ curl -N -X POST http://localhost:8000/api/chat \
   -H "Content-Type: application/json" -H "X-User-Role: OPS" \
   -d '{"query": "Why is my package <a real tracking_id> delayed?"}'
 ```
-
 ## Configuration
 
 All settings have defaults; override by copying `.env.example` to `.env`:
@@ -183,3 +191,4 @@ All settings have defaults; override by copying `.env.example` to `.env`:
 | `AGENT_LLM_MODEL`   | `claude-haiku-4-5-20251001` | Anthropic model, used only when that provider is active |
 | `AGENT_OLLAMA_MODEL` | `llama3.1`     | Ollama model tag — must already be pulled (`ollama pull <model>`) and support tool/function calling |
 | `AGENT_OLLAMA_HOST` | `http://host.docker.internal:11434` | Where the backend container reaches Ollama running on the host |
+| `VITE_GOOGLE_MAPS_API_KEY` | *(empty)* | Google Maps JavaScript API key for the shipment detail drawer's journey map. Without it, the drawer shows a "map disabled" placeholder instead of erroring. Baked into the static frontend build at image-build time — rebuild the frontend after changing it (`docker compose up --build frontend`). |
