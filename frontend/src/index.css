@@ -164,80 +164,6 @@ select {
 }
 
 /* ---------------------------------------------------------------------- */
-/* Side nav                                                                 */
-/* ---------------------------------------------------------------------- */
-
-.sidenav {
-  width: 248px;
-  flex-shrink: 0;
-  background: var(--surface-card);
-  border-right: 1px solid var(--border);
-  padding: 20px 12px 32px;
-  overflow-y: auto;
-}
-
-.sidenav__item {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 11px 12px;
-  border: none;
-  background: transparent;
-  border-radius: 8px;
-  color: var(--text-primary);
-  font-size: 14.5px;
-  font-weight: 500;
-  cursor: pointer;
-  text-align: left;
-}
-
-.sidenav__item:hover {
-  background: var(--surface-hover);
-}
-
-.sidenav__item span:first-of-type {
-  flex: 1;
-}
-
-.sidenav__chevron {
-  color: var(--text-muted);
-}
-
-.sidenav__section {
-  margin: 20px 12px 6px;
-  font-size: 11.5px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-.sidenav__ext {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  color: var(--text-primary);
-  font-size: 14.5px;
-  text-decoration: none;
-}
-
-.sidenav__ext:hover {
-  background: var(--surface-hover);
-}
-
-.sidenav__ext span {
-  flex: 1;
-}
-
-.sidenav__ext-icon {
-  color: var(--text-muted);
-  flex: none;
-}
-
-/* ---------------------------------------------------------------------- */
 /* Page header + KPI row                                                   */
 /* ---------------------------------------------------------------------- */
 
@@ -806,9 +732,6 @@ select {
 }
 
 @media (max-width: 900px) {
-  .sidenav {
-    display: none;
-  }
   .app-main {
     padding: 24px 16px 40px;
   }

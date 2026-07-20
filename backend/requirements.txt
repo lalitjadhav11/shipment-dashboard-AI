@@ -14,4 +14,5 @@ sqlglot==25.1.0                 # Stage 5 SQL AST guardrail validator
 # transitively by sentence-transformers/huggingface-hub. Pinned to a version
 # confirmed compatible with that httpx line.
 anthropic==0.69.0
+google-genai==1.47.0            # Gemini alternative — free tier available, see AGENT_LLM_PROVIDER in llm_client.py
 ollama==0.6.2                   # local-model alternative, see AGENT_LLM_PROVIDER in llm_client.py

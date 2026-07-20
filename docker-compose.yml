@@ -55,12 +55,15 @@ services:
       AGENT_DATABASE_URL: postgresql://agent_ro:${AGENT_DB_PASSWORD:-agent_ro_pw}@db:5432/${POSTGRES_DB:-shipdb_phase1}
       # v1 only (Stage 4b LLM SQL draft, Stage 7 v1 synthesis) — optional. Unset
       # means those stages degrade gracefully to v0's clarifying/template answers.
-      # Provider switch — "anthropic" (cloud, needs a key + credit) or "ollama"
-      # (local model, needs `ollama pull <model>` on the host already done) —
-      # both implement the same call_tool() contract, see llm_client.py.
+      # Provider switch — "anthropic" (cloud, needs a key + credit), "gemini"
+      # (cloud, free tier available), or "ollama" (local model, needs
+      # `ollama pull <model>` on the host already done) — all three implement
+      # the same call_tool() contract, see llm_client.py.
       AGENT_LLM_PROVIDER: ${AGENT_LLM_PROVIDER:-anthropic}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       AGENT_LLM_MODEL: ${AGENT_LLM_MODEL:-claude-haiku-4-5-20251001}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AGENT_GEMINI_MODEL: ${AGENT_GEMINI_MODEL:-gemini-3-flash-preview}
       AGENT_OLLAMA_MODEL: ${AGENT_OLLAMA_MODEL:-llama3.1}
       # host.docker.internal resolves to the host machine from inside the
       # container — Ollama runs on the host, not in this Compose stack.
