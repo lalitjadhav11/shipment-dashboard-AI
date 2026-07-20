@@ -986,3 +986,267 @@ before touching the schema JSON, specifically because §12 already showed that f
 misclassification can silently break another intent's own paraphrase of itself. Full regression
 (18 queries: all tracking-id, reverse-lookup, and fleet-wide intents from §10 through §13) re-run
 clean after the final combination landed.
+
+## 14. Stage 4b/7v1 had no concept of "now" — three stacked bugs from one relative-date query
+
+Live query (against the now-active Anthropic provider — see §2/README's provider config):
+*"Which shipment issues have been open for more than a week."* No template covers open-ended
+issue-age questions, so this correctly reached Stage 4b/7v1 (confirming §13's finding that most
+genuine LLM-routed traffic is date/comparison-flavored, not the aggregate-vs-list confusions
+found earlier). Three bugs surfaced in sequence, each only visible after fixing the one before it:
+
+**Bug 1 — Postgres type ambiguity (`sql_llm.py`, Stage 4b).** The LLM drafted
+`reported_at < %(date)s - INTERVAL '7 days'`. `%(date)s` is a plain Python `str` (Stage 2's
+`entities.dates[0]`, an ISO string, never a typed `datetime`), so psycopg2 binds it as an
+untyped literal. Postgres's operator resolution then picked the `interval - interval` overload
+for `unknown - interval` and tried to parse the date string *as an interval*, failing with
+`invalid input syntax for type interval`. Executor caught it as `ExecutionError` and returned the
+generic "took too long or hit a database error" decline (§ `pipeline.py`'s `EXECUTION_FAILED_ANSWER`)
+— technically correct behavior (no crash), but the message is misleading for a syntax error, not
+a timeout; left as-is since a customer-facing message shouldn't leak raw SQL errors either way.
+Fixed by adding an explicit rule to Stage 4b's system prompt: always write `%(date)s::timestamptz`
+when comparing this parameter, confirmed against a psql repro before touching the prompt
+(`'...' - INTERVAL '7 days'` fails; `'...'::timestamptz - INTERVAL '7 days'` succeeds).
+
+**Bug 2 — semantic double-counting (`sql_llm.py`, found immediately after fixing Bug 1).** The
+query now ran, but computed the wrong cutoff: `entities.dates[0]` is not "today" — it's
+dateparser's *already-resolved* absolute timestamp for whatever relative phrase the user used
+("more than a week" → dateparser itself already resolved this to `now - 7 days`, per
+`PREFER_DATES_FROM: "past"`, §12.1). The LLM's `%(date)s::timestamptz - INTERVAL '7 days'`
+therefore subtracted a *second* week from an already-week-old cutoff, silently answering "more
+than two weeks" instead of "more than one." Fixed by adding an explicit NOTE in Stage 4b's system
+prompt clarifying `%(date)s`'s semantics (already-resolved, use directly, don't re-offset it) —
+this also required rewriting Bug 1's fix example, which had itself demonstrated exactly the
+double-arithmetic pattern the new rule prohibits.
+
+**Bug 3 — Stage 7 v1 had no "now" either (`synthesize.py`).** With both SQL bugs fixed, execution
+returned the correct 200 rows (issues from mid-June, genuinely >1 week old relative to the
+system's current date). But the synthesized answer was still wrong — twice, in different
+directions, across two live tries: first confidently claiming *"none... have been open for more
+than a week"* (contradicting its own grounding data), then more honestly declining with *"there
+is no reference date or current date provided to calculate which issues have been open."* Root
+cause: `synthesize.py`'s system prompt was ROW DATA only — no current-date grounding at all — so
+the LLM either guessed wrong or (more honestly, the second time) correctly identified it couldn't
+do the arithmetic it needed. Fixed by adding a `CURRENT DATE/TIME` line to the prompt (computed
+fresh per request via `datetime.now(timezone.utc)`, not hardcoded) with an explicit instruction to
+use it as "now" for relative-time reasoning instead of declining.
+
+All three fixes are prompt-only changes (`sql_llm.py`, `synthesize.py`) — no change to Stage
+1-3/5/6, which don't touch dates at all. Verified end to end after all three landed: SQL now reads
+`reported_at < %(date)s::timestamptz` (no double offset), executes cleanly, and the synthesized
+answer correctly lists the mid-June issues with accurate reasoning ("since before July 13, 2026").
+Spot-checked one v0 template path (`where_is_my_package`) unaffected, as expected — these modules
+are Stage 4b/7v1-only and never run on the template path.
+
+**Reinforces §9/§12/§13's recurring theme**: an LLM given data with no explicit "now" will not
+reliably infer one from context, and will just as often confidently miscalculate as it will
+honestly decline — grounding facts that seem implicit to a human (today's date, a parameter's
+already-resolved semantics) must be stated explicitly in the prompt, every time, for every stage
+that reasons over time-relative language.
+
+## 15. "Why" questions need a causal answer — a fillable template isn't the same as a right one
+
+Live queries: *"why there are so many orders held at customs"* and *"...at custom"* (typo).
+Neither reached Stage 4b. Both confidently matched a *fillable* v0 template
+(`shipments_by_status` at 0.573; `delay_reason_breakdown` at 0.403) and returned its raw output —
+a bare list of 20 tracking IDs for the first, a fleet-wide reason-distribution table for the
+second. Neither answer explains *why* anything is happening, because neither template's SQL ever
+captured a cause — this is a different class of bug from §13/§14 (which were entity-extraction and
+prompt-grounding gaps): here, Stage 4a "succeeded" by its own definition (intent matched, params
+filled, SQL executed) while still failing the user, because "successfully filled" and "actually
+answers the question" are not the same thing for causal questions specifically.
+
+This came out of a design discussion, not a bug report: the instinct to fix it by routing *every*
+v0 answer through an LLM formatting pass was considered and rejected (again — see the "raw
+timestamps" discussion this section doesn't repeat) — it would tax every trivial lookup with
+latency/cost/Ollama's reliability gaps to fix a problem that has nothing to do with formatting.
+Confirmed why: reformatting `shipments_by_status`'s own row data can make it read nicer, but
+those rows never contained a cause to begin with — no formatting layer invents one. The right
+fix is narrower: recognize *which specific queries* need genuine reasoning (causal "why"
+questions) and make sure exactly those, and only those, reach the stage built for reasoning
+(Stage 4b/7v1) — leaving every other lookup on the free, instant v0 path, unchanged.
+
+**Fix, in two small additions, no changes to Stages 1-3/5/6:**
+1. `TemplateSpec.explains_causation: bool = False` (`sql_templates.py`) — a per-template flag,
+   `True` only for `why_is_it_late`. Every other template is a lookup or a distribution
+   (`status_breakdown`, `delay_reason_breakdown`, `shipments_by_*`, etc.) — genuinely useful
+   context, but not a causal explanation, and conflating the two was the actual bug.
+2. `pipeline.py`'s `_is_causal_query()` — a narrow regex (`why`, `reason(s)`, `cause(s|d)`,
+   word-bounded) — checked only *after* Stage 4a successfully fills a template. If the query is
+   causal-phrased and the resolved intent's template doesn't `explains_causation`, the fill is
+   discarded (treated exactly like a missing required entity) and control falls through to the
+   existing Stage 4b path unchanged — no new fallback logic, just one more way to arrive at the
+   fallback that already existed.
+
+Deliberately narrow on both sides: the regex excludes "how"/"what" (legitimately answered by
+lookups/breakdowns — §13's `status_breakdown` fix depended on exactly that distinction still
+holding), and the flag excludes `delay_reason_breakdown` even though it's reason-*flavored* — a
+fleet-wide distribution table ("CUSTOMS is 16% of delays") is real signal but still isn't an
+explanation of why *this* pattern exists, which is exactly the gap the live queries exposed.
+
+Verified: both original queries now emit `causal_query_needs_llm` and route to Stage 4b, which
+drafted real queries (`v_domestic_vs_international`, `v_status_breakdown`'s customs-status
+sibling) and — notably — answered *honestly* that the available data shows counts, not root
+causes, rather than confidently inventing one (`confidence_score: 0.4` on both, correctly
+reflecting a partial answer). Regression: `"Why is my shipment 700000000001 delayed?"` and
+`"What is the reason my shipment 700000000001 is delayed?"` both still resolve directly to
+`why_is_it_late` with no `causal_query_needs_llm` event — the one template that actually can
+answer causally stays on the free, instant path, exactly as intended; a control query containing
+neither trigger word (`"Give me a breakdown of shipment statuses"`) is unaffected.
+
+Verified generalization (not just the customs case) by simulating the actual routing decision —
+intent classification, entity extraction, template fill, causal check — for 14 held-out queries
+spanning package type, delivery type, customer, location, pickup date, delivery attempts, open
+issues, on-time performance, international split, customs status, and delay-reason breakdown,
+with and without a tracking_id present. All 14 correctly bypass their matched non-explanatory
+template. The gate generalizes by construction (it reads whichever template Stage 1 actually
+resolved, not anything customs-specific) — this confirmed it empirically rather than leaving it
+as an assumption.
+
+### 15.1 Reaching Stage 4b wasn't enough — the LLM still needs to be told *where* the cause lives
+
+Re-running the live "why...customs" query exposed a second, deeper gap in the same causal path.
+`shipment_issues.description` is the ONLY place in the schema with real root-cause text (e.g.
+*"Missing HS code on declaration; awaiting broker resubmission"* for a `CUSTOMS_HOLD` issue) —
+but Stage 3's schema scoping never ranked `shipment_issue` into the top-k for this query at all
+(scored below `v_domestic_vs_international`, `customer`, `shipment`, `v_service_level_mix` — its
+own field/table names are about issue-tracking, not about "customs", so it doesn't score
+topically close even though it's exactly what the question needs). Stage 4b's LLM therefore never
+even saw that table existed, and could only draft a query against count-only views — which is
+why §15's "honest decline" answers, while not wrong, were less complete than they could have
+been.
+
+This is the identical shape of gap `RECORD_LEVEL_ENTITIES` already exists to solve (§ `schema_scope.py`'s docstring: "this isn't a topic-relevance question, it's a *does this query need a different kind of data* question — a different signal than embedding similarity"), just for causal questions instead of record-level ones. Extended the same mechanism rather than inventing a new one: added `CAUSAL_ENTITIES = ["shipment_issue"]`, force-included into `scope_schema()`'s output whenever `is_causal_query(query)` — promoted out of `pipeline.py` into `schema_scope.py` as a shared, single-definition function (Stage 3 and the post-Stage-4a gate in `pipeline.py` both need "is this a why question", so one definition, not two copies drifting apart).
+
+Verified `shipment_issue` now reaches the scoped-entity list (`forced_entities: ['shipment_issue']`) — but a live re-test showed forcing it into scope alone *still wasn't sufficient*: the LLM had `shipment_issues` available and still queried `v_domestic_vs_international` instead, because nothing in the prompt told it *why* that table mattered more for this specific kind of question. Fixed with a third piece: `sql_llm._causal_guidance()`, a system-prompt addition emitted only when the query is causal AND `shipment_issue` is in the scoped entities — explicitly instructing the LLM to prefer `issue_type`/`description` over count-only views for root-cause questions, and to aggregate/sample descriptions rather than return a bare count for fleet-wide questions.
+
+Verified end to end after all three pieces (force-scoping + prompt guidance) landed: the LLM now drafts `SELECT issue_type, COUNT(*), STRING_AGG(DISTINCT description, ...) FROM shipment_issues WHERE issue_type = %(issue_type)s GROUP BY issue_type`, and the synthesized answer names actual recorded causes — *"missing or incomplete customs documentation (such as missing HS codes on declarations), rejected customs declarations requiring resubmission..."* — instead of generic textbook reasons, with `confidence_score` correctly rising from 0.4 to 0.75 to reflect the more complete, grounded answer. Re-verified against the failed-delivery-attempts causal query too (same mechanism, different `issue_type` value) — same pattern holds: real recorded reasons ("recipient not available," "no safe location to leave package") instead of generic ones. Regression: tracking-id-scoped causal queries (`why_is_it_late`), non-causal record-level queries, and unrelated intents all unaffected.
+
+**Three-layer lesson, all in this one causal path**: (1) a successfully-filled template isn't
+necessarily a *right* one (§15's core finding); (2) even after correctly routing to the stage
+built for reasoning, the right *data* has to be scoped in, which plain topical embedding
+similarity won't reliably do for a structurally-different signal (§8/§12.1's `RECORD_LEVEL_ENTITIES`
+precedent, now extended); and (3) even with the right data in scope, an LLM won't necessarily
+recognize *why* it matters more than an easier, topically-adjacent alternative without being told
+directly — the same "state it explicitly, don't rely on the model inferring it" theme as §14's
+missing "now," just for structural relevance instead of temporal grounding.
+
+## 16. Stage 7 v1 didn't know its own SQL had already answered the question
+
+Live query: *"show tracking ids for customer Daniel and Sons."* Every upstream stage worked
+correctly — org_name extracted (`"Daniel and Sons"`), Stage 4b drafted exactly the right SQL
+(`... JOIN customers c ... WHERE c.org_name = %(org_name)s`), it executed and returned 23 real,
+correctly-filtered tracking IDs. The synthesized answer still said *"I don't have customer name
+information... there is no customer name field associated with any of them"* — flatly
+contradicting the fact that filtering by customer name is exactly what had just happened,
+server-side, to produce those exact 23 rows.
+
+Root cause: the SELECT list was `s.tracking_id` only — the LLM that drafted the SQL had no reason
+to also return `org_name` in the output columns, since the user only asked for tracking IDs. But
+`synthesize()` (Stage 7 v1) was only ever given `query` and `rows` — never the SQL that produced
+them. From synthesize's-eye view: a question about a customer name, and rows with no customer
+name column anywhere — a completely reasonable-looking basis to conclude the data doesn't exist,
+except it's wrong, because the filtering already happened in the WHERE clause the synthesizer
+never saw. A column's absence from the *output* was being mistaken for the underlying
+relationship's absence from the *system*.
+
+**Fix:** thread the already-executed SQL and its resolved parameter values through to
+`synthesize()` (`pipeline.py` now passes `sql=validated_sql, params=filled.params`), and add an
+explicit prompt section (`_filter_context()`) stating plainly: this query's WHERE clause has
+ALREADY filtered the rows below according to the user's question, even when the filtered-on
+column isn't repeated in the output — never claim a fact "isn't available" without first
+checking whether it was already used to produce exactly these rows. Same family of fix as
+§14/§15.1: an LLM given partial context will confidently fill the gap with whatever conclusion
+that partial context suggests, and the fix is always to close the gap explicitly, never to hope
+the model infers the missing piece on its own.
+
+Verified: the query now answers *"Here are the tracking IDs for Daniel and Sons: 200000000004,
+700000000288, ..."* with `confidence_score: 1.0`. Regression: re-ran both §15/§15.1's causal
+queries ("why...customs", "shipment issues open for more than a week") — both still produce the
+same correctly-grounded, specific answers as before, confirming the added SQL/params context
+doesn't crowd out or interfere with the earlier causal-guidance or date-grounding prompt
+sections it now sits alongside.
+
+### 16.1 The causal detector only knew literal "why"/"reason"/"cause"
+
+Live query: *"what are the major blocker for international packages."* Same underlying intent as
+§15's bug — "explain what's wrong," not "count/list something" — but none of the literal trigger
+words appeared, so `_CAUSAL_QUERY_RE` never fired and it confidently answered with
+`domestic_vs_international_split`'s bare count table again, the exact same failure shape as
+before the fix, just via a vocabulary gap in the detector rather than a missing template.
+
+Widened the regex to include synonyms for "what's impeding X": `blocker(s)`, `blocking`,
+`bottleneck(s)`, `obstacle(s)`, `impediment(s)`, `hindering`. Deliberately did NOT add bare
+`block(ed)`/`held (up)` stems — verified first (methodology from §12/§13) against both classes
+before committing: `"what is blocking my shipment"` needs to match, but `"shipments blocked from
+delivery"` and `"held up at the hub"` must NOT — those use the same words as *adjectives
+describing a shipment's current state* (a legitimate status/lookup question, already answered
+correctly today), not as a request to explain a cause. A bare stem match would have conflated the
+two and sent ordinary status questions through Stage 4b unnecessarily.
+
+Verified: the original query now emits `causal_query_needs_llm` and routes to Stage 4b, which
+drafted a `shipment_issues` aggregation (reusing §15.1's causal-guidance prompt addition) and
+produced a ranked, data-grounded answer — customs holds (654 cases) as the dominant blocker, with
+the real recorded descriptions, followed by other issues, failed delivery attempts, weather,
+address issues, civil unrest, and lost packages in order — `confidence_score: 0.95`. Regression:
+re-ran the true-negative set live (`"Is X held in customs?"`, `"give me 5 shipments... at
+customs"`, `"Where is tracking number X"`, `"Why is my shipment X delayed?"`) — none emit
+`causal_query_needs_llm`, all still resolve directly to their existing v0 templates at the same
+confidence as before.
+
+**Standing gap, noted rather than chased further**: `_CAUSAL_QUERY_RE` is still a fixed, hand-authored
+word list — inherently unable to cover every possible synonym for "explain what's wrong" (nothing
+stops a future query using yet another phrasing this list doesn't anticipate). This is the same
+fundamental limitation as the embedding classifier itself — keyword/regex detection for intent
+signals will always have a vocabulary boundary somewhere. Not fixing this generically now (that
+would mean routing significantly more queries through the LLM just to *classify* whether they're
+causal, defeating §15's whole reason for keeping this check keyword-based and free); flagging it
+so a future similar bug report is recognized immediately as "same root cause, extend the list"
+rather than re-diagnosed as something new.
+
+### 16.2 Systematic audit: every entity × both phrasing directions
+
+Requested directly, not from a bug report: check every other entity/attribute for the same class
+of gap (§15/§16/§16.1), and check "vice versa" phrasing — does an alternate wording of the same
+question still get answered correctly, without changing what's actually being asked.
+
+Built a 28-query test matrix, two phrasings per entity/attribute (`why...` and a synonym variant
+— `blocker`/`bottleneck`/`obstacle`/`cause`/`reason`/`preventing`/etc.), covering every dimension
+the schema has issue data for: package_type, package_size, delivery_type/service level, a named
+customer, a named city, customs status, pickup scheduling, delivery attempts, open issues
+generally, on-time performance, domestic vs. international, lost packages, and returns. Simulated
+the actual routing decision offline (intent → entity extraction → template fill → causal gate),
+the same free, no-LLM-cost method as §12/§13/§16.1, specifically so this could be checked
+exhaustively rather than sampled.
+
+**Found one real gap this way**: *"what is causing failed deliveries"* — `causal=False`, hit
+`failed_delivery_shipments` directly at 0.795 confidence, the exact §15 failure shape again.
+Root cause: `_CAUSAL_QUERY_RE`'s cause-family pattern (`\bcause[sd]?\b`) covered "cause",
+"causes", "caused" but never the gerund "**causing**" — an extremely ordinary, arguably more
+common form than the ones already covered. Checking specifically for this class of miss (verb
+inflections, not just noun forms) surfaced four more before they could become their own bug
+reports: bare "hinder" (only "hindering" was covered), "preventing"/"prevents" (not covered at
+all), "impeding"/"impede" (only the noun "impediment" was covered), and "obstructing" (not
+covered at all — only "obstacle" was).
+
+**Fix:** rebuilt every word family as a proper inflection group (`\bcaus(?:e[sd]?|ing)\b`,
+`\bhinder(?:ing|s)?\b`, etc.) instead of accumulating specific forms ad hoc as each one happened
+to surface in a live query — the previous approach (§16, §16.1) fixed exactly the form each bug
+report used and nothing more, which is how "causing" was still missing after two prior rounds of
+patching this same regex. Added `prevent`/`obstruct` as new families entirely (the same "impeding
+X" concept, just never yet phrased that way in a query so far). Re-verified against the full
+28-query causal matrix (all now route correctly) plus the standing true-negative set
+(`"blocked from delivery"`, `"held up at the hub"`, etc. — still correctly excluded, confirming
+the inflection rewrite didn't loosen the boundary that keeps status-adjective phrasing off the
+LLM path). Live-verified the originally-found gap end to end: *"what is causing failed
+deliveries"* now emits `causal_query_needs_llm` and answers with the real recorded cause
+("Recipient not available; no safe location to leave package," 400 incidents) instead of a bare
+tracking-ID list.
+
+Everything else in the 28-query matrix was already correct from §15/§15.1/§16/§16.1's earlier
+fixes — this audit's value was specifically in the inflection gap, not in finding a new category
+of routing bug. The "vice versa" framing (checking both a `why` phrasing and its synonym variant
+for the same entity) didn't surface any case where the two phrasings of the same question
+resolved to *different meanings* — both consistently land on the same causal-vs-lookup
+classification for a given entity, which is the actual property being asked about here (a
+rephrasing shouldn't change what's being answered).

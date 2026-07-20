@@ -38,6 +38,61 @@ _LIST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Same category of miss as RECORD_LEVEL_ENTITIES above, for causal ("why")
+# questions specifically: shipment_issue.description is the ONLY entity in
+# the schema with actual free-text root-cause explanations (e.g. "Missing HS
+# code on declaration; awaiting broker resubmission" for a CUSTOMS_HOLD
+# issue) — everything else is enum codes or plain counts. It's topically
+# unrelated-scoring for a fleet-wide "why" question (its own field/table
+# names are about issue tracking, not about whatever attribute the question
+# is asking "why" about), so it loses the top-k ranking to dashboard views
+# that only have counts — meaning Stage 4b's LLM never even sees the one
+# table that could ground a real answer, and has to fall back to generic
+# domain knowledge instead. See AGENTIC_RAG_ARCHITECTURE.md §15.1.
+CAUSAL_ENTITIES = ["shipment_issue"]
+
+# Live query: "what are the major blocker for international packages" carries
+# the same "explain what's wrong" intent as "why...", but the literal words
+# "why"/"reason"/"cause" never appear — verified this slipped through
+# uncaught (confidently answered with domestic_vs_international_split, a
+# plain count breakdown, same failure shape as §15's original bug). Widened
+# past literal causal vocabulary to include synonyms for "what's impeding
+# X" — deliberately NOT "block(ed)"/"held (up)" as bare stems, which would
+# false-positive on ordinary status descriptions ("shipments blocked from
+# delivery", "held up at the hub" — ADJECTIVES describing a shipment's
+# state, not a request to explain a cause). Verified against both classes
+# before committing — see AGENTIC_RAG_ARCHITECTURE.md §16.1.
+#
+# A systematic audit across every entity/attribute in the schema (§16.2)
+# then found the SAME word families still had gerund/verb forms missing —
+# "what is CAUSING failed deliveries" matched none of the patterns above
+# (only cause/causes/caused, never "causing") and confidently hit the wrong
+# template exactly like the original bug. Rebuilt each family as a full
+# inflection group (base/-s/-ed/-ing) instead of a fixed list of forms
+# spotted ad hoc, and added "prevent"/"obstruct" — the same "impeding X"
+# concept, just not yet seen in a live query. Verified against the same
+# true-negative set (status/lookup phrasing using "blocked"/"held up" as
+# adjectives) before committing — none of the new inflections reopen that.
+_CAUSAL_QUERY_RE = re.compile(
+    r"\bwhy\b|\breasons?\b"
+    r"|\bcaus(?:e[sd]?|ing)\b"
+    r"|\bblock(?:er[s]?|ing)\b"
+    r"|\bbottleneck[s]?\b"
+    r"|\bobstacle[s]?\b"
+    r"|\bobstruct(?:ing|ion[s]?|s)?\b"
+    r"|\bimped(?:iment[s]?|ing|e[sd]?)\b"
+    r"|\bhinder(?:ing|s)?\b"
+    r"|\bprevent(?:ing|s)?\b",
+    re.IGNORECASE,
+)
+
+
+def is_causal_query(query: str) -> bool:
+    """Shared with pipeline.py's post-Stage-4a gate — one definition of
+    "this is a 'why' question" for both the entity-forcing use here and the
+    template-rejection use there."""
+    return bool(_CAUSAL_QUERY_RE.search(query))
+
 
 @dataclass
 class ScopedSchema:
@@ -74,6 +129,13 @@ def scope_schema(query: str, extracted=None, top_k: int = DEFAULT_TOP_K) -> Scop
     forced = []
     if _wants_individual_records(query, extracted):
         for entity in RECORD_LEVEL_ENTITIES:
+            if entity not in ranked and entity in scored_lookup:
+                ranked.append(entity)
+                scores[entity] = scored_lookup[entity]
+                forced.append(entity)
+
+    if is_causal_query(query):
+        for entity in CAUSAL_ENTITIES:
             if entity not in ranked and entity in scored_lookup:
                 ranked.append(entity)
                 scores[entity] = scored_lookup[entity]

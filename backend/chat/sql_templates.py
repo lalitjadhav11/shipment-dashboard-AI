@@ -44,6 +44,11 @@ class TemplateSpec:
     entity_keys: tuple  # one per table/view this template's SQL touches
     sql: str
     required: tuple  # ExtractedEntities attribute names that must be present
+    explains_causation: bool = False  # True only for templates whose SQL + formatter actually
+    # answer "why" (a reason/cause), not just "what"/"how many" — a breakdown-by-reason table is
+    # a distribution, not an explanation. pipeline.py checks this before accepting a Stage 4a
+    # match for a causal-phrased query ("why is X happening") — see AGENTIC_RAG_ARCHITECTURE.md
+    # §15. Deliberately narrow: only why_is_it_late qualifies today.
 
 
 def _tracking_id_params(entities):
@@ -108,6 +113,7 @@ TEMPLATES = {
             WHERE tracking_id = %(tracking_id)s
         """,
         required=("tracking_id",),
+        explains_causation=True,
     ),
     "shipment_customer_lookup": TemplateSpec(
         intent="shipment_customer_lookup",

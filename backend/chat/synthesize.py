@@ -9,6 +9,7 @@ module. See AGENTIC_RAG_ARCHITECTURE.md §4 Stage 7 v1 for the routing
 rationale and the "why not a full replacement" reasoning.
 """
 import json
+from datetime import datetime, timezone
 
 from . import llm_client
 from .respond_template import ShipmentAnswer
@@ -58,12 +59,44 @@ def _rows_for_prompt(rows: list) -> str:
     return text
 
 
-def synthesize(query: str, rows: list) -> ShipmentAnswer:
+def _filter_context(sql: str | None, params: dict | None) -> str:
+    """Live query: "show tracking ids for customer Daniel and Sons" correctly
+    drafted `... JOIN customers c ... WHERE c.org_name = %(org_name)s` and
+    correctly returned 23 matching tracking_ids — but the SELECT list only
+    had `tracking_id`, no `org_name` column, and synthesize() previously had
+    no idea a WHERE clause had run at all. Result: the LLM saw rows with no
+    customer-name field and concluded "I don't have customer name
+    information," flatly contradicting the fact that filtering by customer
+    name is exactly what had just happened server-side. A column's absence
+    from the OUTPUT is not evidence the underlying relationship doesn't
+    exist — it's still one bare row-list away from that filter being visible.
+    Passing the already-executed SQL + resolved params closes that gap."""
+    if not sql:
+        return ""
+    params_text = ", ".join(f"{k} = {v!r}" for k, v in (params or {}).items()) or "(none)"
+    return (
+        f"\nSQL ALREADY EXECUTED (for your context only — do not repeat it to the user):\n{sql}\n"
+        f"PARAMETER VALUES USED: {params_text}\n"
+        "This query's WHERE clause has ALREADY filtered ROW DATA according to the user's "
+        "specific question — every row below already satisfies it, even when the filtered-on "
+        "column (e.g. a customer name used only in a JOIN condition) isn't repeated in the "
+        "SELECT output. Never claim a fact 'isn't available' or 'doesn't exist in the data' "
+        "just because a column is absent from ROW DATA — check whether it was already used to "
+        "produce exactly these rows before concluding that.\n"
+    )
+
+
+def synthesize(query: str, rows: list, sql: str | None = None, params: dict | None = None) -> ShipmentAnswer:
     system_prompt = (
         "You answer questions about shipments for a logistics chat agent, using ONLY the "
         "row data below — never state a fact not present in it. If the data only partially "
         "answers the question, say so explicitly and lower confidence_score accordingly. If "
         "there are zero rows, say clearly that nothing matching the question was found.\n\n"
+        f"CURRENT DATE/TIME: {datetime.now(timezone.utc).isoformat()} — use this as \"now\" for "
+        "any relative-time reasoning (\"how long ago\", \"more than N days\", \"this week\"). "
+        "Do the arithmetic yourself from the timestamps in ROW DATA; never say you lack a "
+        "reference date.\n"
+        f"{_filter_context(sql, params)}\n"
         f"ROW DATA:\n{_rows_for_prompt(rows)}\n\n"
         f"You MUST respond by calling the {TOOL_NAME} function — never respond with plain "
         "text, explanation, or reasoning outside of it. Call the function now."

@@ -58,6 +58,17 @@ EXECUTION_FAILED_ANSWER = {
 # already falls straight through to Stage 4b today; nothing to fix there.
 MINIMAL_QUERY_MAX_WORDS = 4
 
+# Live query: "why there are so many orders held at customs" confidently matched
+# shipments_by_status (a fillable, non-explanatory template — just a list of
+# tracking IDs) instead of falling through to Stage 4b, so the answer never
+# addressed "why" at all — no formatting fix could have helped, because the
+# template's SQL never captured a cause to format. See
+# AGENTIC_RAG_ARCHITECTURE.md §15. Deliberately narrow phrasing (not "how"/
+# "what" — those are legitimately answered by lookups/breakdowns). Detector
+# lives in schema_scope.py (schema_scope.is_causal_query) since Stage 3 also
+# needs it, to force shipment_issue into scope for the same queries — one
+# definition, reused here rather than duplicated (see §15.1).
+
 
 def _is_minimal_query(query: str, tracking_ids: list) -> bool:
     """True for a genuinely bare query — just a tracking number, or barely
@@ -218,6 +229,20 @@ def run_pipeline(query: str):
                 "reason": "intent matched but a required entity (e.g. tracking_id) "
                           "wasn't found in the query — trying the Stage 4b LLM fallback",
             }}
+        elif schema_scope.is_causal_query(query) and not sql_templates.TEMPLATES[resolved_intent].explains_causation:
+            # A successfully-filled template is not necessarily the RIGHT answer to a
+            # "why" question — a lookup or breakdown-by-reason template runs fine and
+            # returns rows, but never captures a cause, so its answer would silently
+            # not address the question. Treat this the same as an unfilled template:
+            # discard it and let Stage 4b (which can draft a query AND explain the
+            # result in prose) have a real shot instead.
+            yield {"stage": "causal_query_needs_llm", "detail": {
+                "reason": "the query asks 'why', but the matched template only looks up "
+                          "or counts records rather than explaining a cause — routing to "
+                          "Stage 4b instead of returning a non-answer",
+                "intent": resolved_intent,
+            }}
+            filled = None
 
     if filled is None:
         # Stage 4a is exhausted — either nothing matched, or something matched
@@ -268,7 +293,7 @@ def run_pipeline(query: str):
     # reaches the v1 LLM synthesizer — see AGENTIC_RAG_ARCHITECTURE.md §4
     # Stage 7 for why this is routing, not a full replacement.
     if filled.source == "llm":
-        answer = synthesize.synthesize(query, result.rows)
+        answer = synthesize.synthesize(query, result.rows, sql=validated_sql, params=filled.params)
     else:
         answer = respond_template.format_response(resolved_intent, result.rows, extracted)
 
