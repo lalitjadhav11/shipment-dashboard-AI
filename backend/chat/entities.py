@@ -80,6 +80,33 @@ def _query_ngrams(query: str, max_n: int = 3) -> list:
     ]
 
 
+_PREFIX_MATCH_THRESHOLD = 90  # stricter than FUZZY_MATCH_THRESHOLD — see below
+_PREFIX_MIN_LEN = 4  # excludes connector words ("in", "at", "to") from the prefix path
+
+
+def _prefix_word_score(ngram: str, readable_phrase: str) -> float:
+    """A single query word ("customs") against just the FIRST word of a
+    multi-word enum value ("customs hold") — fuzz.ratio's whole-phrase
+    comparison penalizes this by length ("customs" vs "customs hold" scores
+    73.7, under FUZZY_MATCH_THRESHOLD) even though a leading-word match is a
+    strong, specific signal in practice (confirmed live: "give me 5
+    shipments those are at customs" never matched CUSTOMS_HOLD without this).
+    Bounded narrowly on purpose so it doesn't reopen the LOST_PACKAGE bug
+    this module already fixed once (see _query_ngrams' docstring): only
+    checks the FIRST word specifically, not "any word anywhere" — "package"
+    is the second word of "lost package", so it scores 0 here (correctly
+    excluded), while still being the first word of "package received" and
+    genuinely matching that. Requiring >=4 chars excludes short connector
+    words ("in transit", "at distribution hub") that would otherwise fire on
+    nearly every query."""
+    if " " in ngram:
+        return 0.0
+    lead = readable_phrase.split(" ", 1)[0]
+    if len(lead) < _PREFIX_MIN_LEN:
+        return 0.0
+    return fuzz.ratio(ngram, lead)
+
+
 def _extract_enum_matches(query: str, schema: dict) -> dict:
     matches = {}
     ngrams = _query_ngrams(query)
@@ -97,6 +124,10 @@ def _extract_enum_matches(query: str, schema: dict) -> dict:
             hit = process.extractOne(ngram, readable, scorer=fuzz.ratio)
             if hit and hit[1] > best_score:
                 best_score, best_idx = hit[1], hit[2]
+            for idx, phrase in enumerate(readable):
+                prefix_score = _prefix_word_score(ngram, phrase)
+                if prefix_score >= _PREFIX_MATCH_THRESHOLD and prefix_score > best_score:
+                    best_score, best_idx = prefix_score, idx
         if best_idx is not None and best_score >= FUZZY_MATCH_THRESHOLD:
             matches[field_name] = allowed[best_idx]  # original (not readable) form
     return matches

@@ -67,7 +67,7 @@
         "intent": "customs_status",
         "entities": ["shipment"],
         "recommended_query": "SELECT customs_status, is_international FROM shipments WHERE tracking_id = $1;",
-        "example_nl": "Is my international package stuck in customs?"
+        "example_nl": "Is tracking number 794658312457 held in customs right now?"
       },
       {
         "intent": "open_issues_for_shipment",
@@ -97,7 +97,7 @@
         "intent": "status_breakdown",
         "entities": ["v_status_breakdown"],
         "recommended_query": "SELECT * FROM v_status_breakdown ORDER BY shipment_count DESC;",
-        "example_nl": "Give me a breakdown of shipments by current status."
+        "example_nl": "How many shipments are in each status category — give me the count breakdown, not individual shipments."
       },
       {
         "intent": "ontime_performance",
@@ -151,7 +151,7 @@
         "intent": "shipments_by_status",
         "entities": ["shipment"],
         "recommended_query": "SELECT * FROM shipments WHERE current_status = $1 ORDER BY updated_at DESC LIMIT 20;",
-        "example_nl": "Show me shipments that are lost."
+        "example_nl": "Give me 5 shipments that currently have status customs hold."
       },
       {
         "intent": "shipments_by_package_type",

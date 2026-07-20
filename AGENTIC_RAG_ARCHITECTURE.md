@@ -907,3 +907,82 @@ with the existing single-best-match enum design elsewhere; `shipments_by_pickup_
 17th" — 20 rows, all `pickup_date = 2026-07-17`). Full regression re-run across all 15
 tracking-id, reverse-lookup, and fleet-wide intents from this and §12's first half — all correct,
 0 backend errors. Template count: **25 → 28**.
+
+## 13. "give me 5 shipments those are at customs" — a Stage 2 scoring gap, and its Stage 1 shadow
+
+Live query: *"give me 5 shipments those are at customs"*. Wanted: up to 5 individual shipments
+currently in `CUSTOMS_HOLD`. Got: `status_breakdown` — a fleet-wide aggregate table of every
+status's count, ignoring "customs" and "5" entirely. Two independent bugs stacked here, in two
+different stages; both had to be fixed for the query to work.
+
+**Bug 1 (Stage 2 — `entities.py`):** `_extract_enum_matches` never populated
+`current_status: CUSTOMS_HOLD` at all. Root cause: `fuzz.ratio` is a symmetric whole-string
+comparison, so it penalizes `"customs"` against `"customs hold"` by length exactly as much as it
+penalizes any other 5-character difference — scoring 73.7, under `FUZZY_MATCH_THRESHOLD` (80).
+Meanwhile `reason_for_delay=CUSTOMS` (exact single-word match, scores 100) and
+`package_type=CUSTOM` (near-exact, scores ~92) both cleared threshold easily, because those
+enum values happen to be single words. This is a systematic bias against multi-word enum values
+(`CUSTOMS_HOLD`, `CUSTOMS_CLEARED`, `PACKAGE_RECEIVED`, `CIVIL_UNREST`, ...) whenever the query
+uses just their leading word — likely under-firing silently for all of them, not just this case.
+
+Considered and rejected two "just use a different scorer" fixes before landing on a narrower
+one: `fuzz.token_set_ratio` and `fuzz.partial_ratio` both score `"customs"` vs `"customs hold"`
+at 100 (fixing this case) — but they *also* score `"package"` vs `"lost package"` at 100,
+directly reopening the exact false-positive `_query_ngrams`' n-gram-plus-`fuzz.ratio` design was
+built to prevent (§ entities.py docstring). Neither scorer distinguishes "query word is the
+candidate's leading word" (`"customs"` → `"customs hold"`, a strong, specific signal) from "query
+word appears anywhere in the candidate" (`"package"` → `"lost package"`, the word is the *second*
+token and is common/generic across many enum values — `PACKAGE_RECEIVED`, `package_type`'s
+field name, `package_desc`, etc.).
+
+**Fix:** `_prefix_word_score()` — a narrow, additional check alongside the existing whole-phrase
+`fuzz.ratio`, not a replacement for it. For a single-word n-gram, compare it (via `fuzz.ratio`,
+so still typo-tolerant) against *only the first word* of each multi-word candidate, gated to
+leading words ≥4 characters (excludes connector words — `"in transit"`, `"at distribution hub"`
+would otherwise fire on nearly every query). Verified against exactly the case that motivated
+each design constraint: `"customs"` → `CUSTOMS_HOLD`/`CUSTOMS_CLEARED` now scores 100 (fixed);
+`"package"` → `LOST_PACKAGE` still scores 0 (second word, correctly excluded — the earlier fix
+holds); `"package"` → `PACKAGE_RECEIVED` scores 100 (genuinely is the first word there, and is a
+plausible, non-surprising interpretation, unlike `LOST_PACKAGE`); `"in"`/`"at"` → any candidate
+score 0 (below the 4-char floor).
+
+**Bug 2 (Stage 1 — intent classification), found only after fixing Bug 1:** entity extraction
+now correctly produced `current_status: CUSTOMS_HOLD`, but the *intent* still resolved to
+`status_breakdown` (0.644) over `shipments_by_status` (0.590) — the classifier was choosing
+the aggregate-breakdown intent over the individual-shipments-list intent. Broader check (not just
+this query) showed `shipments_by_status` was losing to `status_breakdown` for essentially *any*
+status-flavored phrasing, including its own paraphrases — `status_breakdown`'s example
+(`"Give me a breakdown of shipments by current status"`) is generic enough to act as a broad
+attractor for anything mentioning "shipments" and "status" together, aggregate or not.
+
+Fixed by rewording **both** intents' `example_nl` together, not just the losing one — grid-tested
+across 7 held-out paraphrases spanning both the list intent (`"give me 5 shipments... customs"`,
+`"show me shipments with status delivered"`, `"list shipments that are lost"`) and the genuine
+aggregate intent (`"give me a breakdown of shipment statuses"`, `"what percentage of shipments
+are in transit vs delivered"`) before picking the combination that got all 7 right, not just the
+one motivating query — a single one-sided reword earlier in this round (§12) already proved
+capable of overcorrecting one query while breaking a different one. `status_breakdown`'s example
+now explicitly contrasts itself against the list case (`"...give me the count breakdown, not
+individual shipments"`); `shipments_by_status`'s now mirrors the real bug query's shape
+(`"Give me 5 shipments that currently have status customs hold"`) instead of a single-word enum
+example that undersold what the intent actually returns.
+
+That reword had its own second-order effect: `shipments_by_status`'s new "customs hold"-flavored
+example started winning `"Is 700000000001 held in customs?"` away from `customs_status` (0.577 vs
+0.522) — different from Bug 1/2 (a missing capability), this was an honest answer to the wrong
+question: `shipments_by_status` doesn't require `tracking_id`, so pipeline.py's existing
+fleet-intent override guard (§9) correctly caught the mismatch and redirected to
+`where_is_my_package` — not wrong, but less precise than `customs_status`'s dedicated "domestic
+shipment, no customs processing applies" answer. Fixed by strengthening `customs_status`'s own
+example to include an explicit tracking number placeholder (`"Is tracking number 794658312457
+held in customs right now?"`), restoring a comfortable margin (0.712 vs 0.577) — reverified
+against 5 customs-phrasing paraphrases across all three competing intents (`customs_status`,
+`shipments_by_status`, `status_breakdown`) with no regressions.
+
+**Methodology reinforcement:** every reword in this section was validated with the offline
+`intent.rank_intents()` loop from §12's methodology note, extended one step further — grid-testing
+*pairs* of candidate examples against a *held-out query set* (not just the one motivating query)
+before touching the schema JSON, specifically because §12 already showed that fixing one query's
+misclassification can silently break another intent's own paraphrase of itself. Full regression
+(18 queries: all tracking-id, reverse-lookup, and fleet-wide intents from §10 through §13) re-run
+clean after the final combination landed.
