@@ -1262,3 +1262,47 @@ for the same entity) didn't surface any case where the two phrasings of the same
 resolved to *different meanings* — both consistently land on the same causal-vs-lookup
 classification for a given entity, which is the actual property being asked about here (a
 rephrasing shouldn't change what's being answered).
+
+### 16.3 A different question shape hits the same bug: "what does X include" is not "why"
+
+Live query: *"What does the 'OTHER' category of delays include?"* — matched `delay_reason_breakdown`
+(0.629 confidence) and returned the full 7-row breakdown table, the exact same non-answer shape
+as §15's original bug. But `_CAUSAL_QUERY_RE` correctly did NOT fire here — this isn't a "why"
+question at all. It's a different question type entirely: asking what a category's *contents* or
+*definition* are, not asking for a *cause*. Same failure (a fillable, non-explanatory template
+wins and returns raw data instead of addressing what was actually asked), different trigger
+vocabulary — confirming §16.1's "standing gap" note was right to flag this as an open-ended
+vocabulary boundary rather than a one-time fix.
+
+Extended `_CAUSAL_QUERY_RE` (same regex, not a parallel mechanism — the downstream handling
+`is_causal_query()` drives is identical either way: force `shipment_issue` into scope, decline a
+matched-but-non-explanatory template) with a second word family for this question shape:
+`include(s/d)`, `makes up`/`make up`, `falls under`/`fall under`, `consists of`/`consist of`,
+`comprise(s/d/ing)`, and the bare phrase `what does`. Verified against both classes before
+committing (same methodology as §16.1/§16.2): 7 true positives (the live query, `"what does X
+mean"`, `"what falls under Y"`, `"what makes up Z"`, `"what is included in Y"`, plus the two
+already-fixed causal examples as a non-regression check) all matched; 6 true-negative lookups
+(`"give me 5 shipments... customs"`, `"show me shipments with status delivered"`, `"is my
+shipment held in customs"`, `"where is tracking number X"`, `"show me express shipments"`,
+`"which shipments are going to Seattle"`) all correctly did not.
+
+Verified end to end: the query now routes to Stage 4b and produces a genuinely on-topic,
+data-grounded answer — including an accurate, non-obvious observation the raw breakdown could
+never have surfaced: `shipment_issues.issue_type`'s enum has no dedicated `MECHANICAL_ISSUE`
+value (only `shipments.reason_for_delay` does), so mechanical-issue delays get folded into the
+`OTHER` issue_type bucket alongside genuinely generic ones — the synthesized answer correctly
+distinguishes "mechanical issues are the most specific sub-category" from "the remaining incidents
+fall under a general 'other' description," `confidence_score: 0.95`. Regression: the same 4-query
+true-negative spot check (`shipments_by_status`, `where_is_my_package`,
+`shipments_by_delivery_type`, `why_is_it_late`) still resolves directly to its template, unaffected.
+
+**On "should every call go through the LLM" (raised again prompting this fix):** the answer is
+still no, for the same reasons as §15's original discussion and the "raw timestamps" thread before
+it — cost, latency, and provider reliability (this session directly hit Gemini's free-tier 20
+req/day quota and an Ollama-era pattern of silently-ignored forced-tool-choice) apply to blanket
+routing regardless of which specific query motivated asking again. What changed both times a new
+example surfaced (§15→§16.1→§16.2→§16.3) is recognizing one more *shape* of question that
+genuinely needs synthesis and routing exactly that shape to Stage 4b — not abandoning the
+tiered design. The pattern across all four rounds: every "this looks like the LLM should have
+handled it" report so far has turned out to be a **routing** gap (the wrong, non-explanatory
+template winning), not evidence that routing itself is the wrong strategy.

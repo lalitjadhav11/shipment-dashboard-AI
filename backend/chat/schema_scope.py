@@ -82,7 +82,19 @@ _CAUSAL_QUERY_RE = re.compile(
     r"|\bobstruct(?:ing|ion[s]?|s)?\b"
     r"|\bimped(?:iment[s]?|ing|e[sd]?)\b"
     r"|\bhinder(?:ing|s)?\b"
-    r"|\bprevent(?:ing|s)?\b",
+    r"|\bprevent(?:ing|s)?\b"
+    # Live query: "What does the 'OTHER' category of delays include?" — a
+    # DIFFERENT question shape than "why" (asking what a category's contents
+    # /definition are, not asking for a cause), but it hit the exact same
+    # failure: delay_reason_breakdown confidently answered with the full
+    # breakdown table instead of addressing what "OTHER" actually contains.
+    # Needs the same fix (force shipment_issue into scope, decline the
+    # non-explanatory template) as the causal case, so folded into the same
+    # detector rather than building a parallel mechanism — the downstream
+    # handling is identical either way. Verified against both classes before
+    # committing — see AGENTIC_RAG_ARCHITECTURE.md §16.3.
+    r"|\binclude[sd]?\b|\bmakes? up\b|\bfalls? under\b|\bconsists? of\b"
+    r"|\bcompris(?:e[sd]?|ing)\b|\bwhat does\b",
     re.IGNORECASE,
 )
 
