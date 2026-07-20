@@ -9,10 +9,11 @@ answer.
 - **v0** (Stages 1-3, 4a, 5, 6, Stage 7 v0 template formatter): live in `backend/chat/`,
   tested end-to-end against the seeded database, including a corner-case audit (see §9).
 - **v1** (Stage 4b LLM SQL draft, Stage 7 v1 LLM synthesis, `sql_llm.py`/`synthesize.py`/
-  `llm_client.py`): live-verified with two interchangeable LLM providers, switched by
-  `AGENT_LLM_PROVIDER` — **`anthropic`** (cloud) and **`ollama`** (local, no API cost) — both
-  behind the exact same `call_tool()` contract, so `sql_llm.py`/`synthesize.py` never branch on
-  which is active. Verified along the way: graceful degradation with no provider configured/
+  `llm_client.py`): live-verified with three interchangeable LLM providers, switched by
+  `AGENT_LLM_PROVIDER` — **`anthropic`** (cloud, paid), **`gemini`** (cloud, free tier), and
+  **`ollama`** (local, no API cost) — all three behind the exact same `call_tool()` contract, so
+  `sql_llm.py`/`synthesize.py` never branch on which is active. Verified along the way: graceful
+  degradation with no provider configured/
   reachable (falls through to v0's clarifying answer, no crash); the Stage 4b → Stage 5
   guardrail round-trip caught and fixed a real bug (aliased `SELECT` columns like
   `count(*) AS shipment_count` were wrongly rejected — fixed in `guardrails.py`'s
@@ -447,7 +448,7 @@ this scale. Going from v0 to v1 is two new files and a couple of `if` branches i
 | DB access | `asyncpg` (or existing `psycopg2` for parity) | v0 |
 | Streaming | `sse-starlette` | v0 |
 | Audit | `shipment_chat_log` table (already in schema) | v0 |
-| LLM calls | Anthropic Python SDK (`anthropic==0.69.0` — 0.39.0 crashes, see §9) **or** `ollama` Python client, switched by `AGENT_LLM_PROVIDER` — same `call_tool()` contract either way | **v1 only** |
+| LLM calls | Anthropic Python SDK (`anthropic==0.69.0` — 0.39.0 crashes, see §9), `google-genai` (Gemini), **or** `ollama` Python client, switched by `AGENT_LLM_PROVIDER` — same `call_tool()` contract either way | **v1 only** |
 
 ## 8. Scalability path
 
@@ -560,11 +561,22 @@ a real LLM call yet (no API key was available in the build environment — see b
 
 ### v1 live verification — full test record
 
-**Provider abstraction.** `llm_client.py` supports two providers behind one `call_tool()`
+**Provider abstraction.** `llm_client.py` supports three providers behind one `call_tool()`
 contract, switched by `AGENT_LLM_PROVIDER`:
 - `anthropic` — cloud, needs `ANTHROPIC_API_KEY` + account credit. Supports forced tool-choice
   (`tool_choice={"type": "tool", "name": ...}`), so the model has no way to respond without
   calling the function.
+- `gemini` — cloud, needs `GEMINI_API_KEY`, free tier available (get one at
+  https://aistudio.google.com/apikey). Also supports forced function-calling
+  (`tool_config.function_calling_config.mode="ANY"` + `allowed_function_names`), same reliability
+  guarantee as Anthropic's forced tool-choice. Uses `AGENT_GEMINI_MODEL` (default
+  `gemini-3-flash-preview` — the 2.x stable models returned "not available to new users"/zero
+  free-tier quota when tested against a fresh API key; the 3.x preview line is what's actually
+  reachable on a new project's free tier). Schema translation needed one adjustment:
+  Gemini's `FunctionDeclaration.parameters` is an OpenAPI-style Schema with no JSON-Schema
+  `"type": ["string", "null"]` union — `_to_gemini_schema()` recursively rewrites that as
+  `type: <that type>` + `nullable: true` so callers' plain JSON-Schema tool definitions (shared
+  with the Anthropic/Ollama path) never need a Gemini-specific variant.
 - `ollama` — local, needs `ollama pull <model>` already done on the host and a model with tool-
   calling support (confirmed via `capabilities` in `ollama list` / `/api/tags`). Reached from
   inside the backend container via `host.docker.internal` (an explicit `extra_hosts` mapping in
