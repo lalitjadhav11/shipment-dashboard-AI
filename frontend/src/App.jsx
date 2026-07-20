@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import TopBar from "./components/TopBar.jsx";
-import SideBar from "./components/SideBar.jsx";
 import KpiRow from "./components/KpiRow.jsx";
 import AiInsightPanel from "./components/AiInsightPanel.jsx";
 import ShipmentsTable from "./components/ShipmentsTable.jsx";
@@ -52,7 +51,6 @@ export default function App() {
     <div className="app-shell">
       <TopBar value={agentQuery} onAsk={handleAsk} />
       <div className="app-body">
-        <SideBar />
         <main className="app-main">
           <div className="page-header">
             <div>

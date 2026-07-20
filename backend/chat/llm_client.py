@@ -5,13 +5,16 @@ two v1 LLM touchpoints — Stage 4b (sql_llm.py) and Stage 7 v1
 provider is active, so retry/error handling and provider selection live in
 one place.
 
-Two providers, switched by AGENT_LLM_PROVIDER (default "anthropic"):
+Three providers, switched by AGENT_LLM_PROVIDER (default "anthropic"):
   - "anthropic": Claude via the Anthropic API (needs ANTHROPIC_API_KEY, real cost/latency)
+  - "gemini":    Gemini via the Google GenAI API (needs GEMINI_API_KEY — has a
+                 free tier, see https://aistudio.google.com/apikey)
   - "ollama":    a local model via Ollama (needs `ollama pull <model>` on the
                  host and a model that supports tool/function calling —
                  e.g. llama3.1, llama3.2, qwen2.5, mistral-nemo)
-Both implement the exact same call_tool() contract, so sql_llm.py/synthesize.py
-never branch on provider — switching is a single env var, no code change.
+All three implement the exact same call_tool() contract, so
+sql_llm.py/synthesize.py never branch on provider — switching is a single env
+var, no code change.
 
 Design rule carried over from the architecture doc: an LLM failure (missing
 key/host unreachable, network error, malformed response, rate limit) must
@@ -26,6 +29,11 @@ import sys
 PROVIDER = os.environ.get("AGENT_LLM_PROVIDER", "anthropic").lower()
 
 ANTHROPIC_MODEL = os.environ.get("AGENT_LLM_MODEL", "claude-haiku-4-5-20251001")
+# gemini-2.5-flash and gemini-2.0-flash both returned "not available to new
+# users" / zero free-tier quota when tested against a fresh API key — the
+# 3.x preview line is what's actually reachable on a new project's free tier
+# right now. Revisit if Google reopens free-tier quota on the stable models.
+GEMINI_MODEL = os.environ.get("AGENT_GEMINI_MODEL", "gemini-3-flash-preview")
 OLLAMA_MODEL = os.environ.get("AGENT_OLLAMA_MODEL", "llama3.1")
 OLLAMA_HOST = os.environ.get("AGENT_OLLAMA_HOST", "http://host.docker.internal:11434")
 MAX_TOKENS = 1024
@@ -74,6 +82,85 @@ def _call_anthropic(system_prompt: str, user_message: str, tool_name: str, tool_
             return block.input
 
     print(f"[chat] Anthropic response had no {tool_name} tool_use block", file=sys.stderr)
+    return None
+
+
+# --- Gemini ----------------------------------------------------------------
+
+def _get_gemini_client():
+    if "gemini" not in _client_state:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            _client_state["gemini"] = None
+        else:
+            from google import genai
+            _client_state["gemini"] = genai.Client(api_key=api_key)
+    return _client_state["gemini"]
+
+
+def _to_gemini_schema(schema):
+    """Gemini's FunctionDeclaration.parameters is an OpenAPI-style Schema —
+    it has no JSON-Schema-style `"type": ["string", "null"]` union; nullable
+    fields are `type: <that type>` + `nullable: true` instead. Recurses so
+    callers' plain JSON-Schema dicts (shared with the Anthropic/Ollama path)
+    never need to know this."""
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for key, value in schema.items():
+        if key == "type" and isinstance(value, list):
+            non_null = [t for t in value if t != "null"]
+            out["type"] = non_null[0] if non_null else "string"
+            if "null" in value:
+                out["nullable"] = True
+        elif key == "properties" and isinstance(value, dict):
+            out["properties"] = {k: _to_gemini_schema(v) for k, v in value.items()}
+        elif key == "items":
+            out["items"] = _to_gemini_schema(value)
+        else:
+            out[key] = value
+    return out
+
+
+def _call_gemini(system_prompt: str, user_message: str, tool_name: str, tool_schema: dict) -> dict | None:
+    client = _get_gemini_client()
+    if client is None:
+        print("[chat] GEMINI_API_KEY not set — LLM stage unavailable, falling back", file=sys.stderr)
+        return None
+
+    from google.genai import types
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=MAX_TOKENS,
+                tools=[types.Tool(function_declarations=[types.FunctionDeclaration(
+                    name=tool_name,
+                    description=tool_schema.get("description", ""),
+                    parameters=_to_gemini_schema(tool_schema["input_schema"]),
+                )])],
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode="ANY",
+                        allowed_function_names=[tool_name],
+                    )
+                ),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — any SDK/network failure degrades gracefully
+        print(f"[chat] Gemini call failed ({tool_name}): {exc}", file=sys.stderr)
+        return None
+
+    for candidate in response.candidates or []:
+        for part in candidate.content.parts or []:
+            fc = getattr(part, "function_call", None)
+            if fc and fc.name == tool_name:
+                return dict(fc.args)
+
+    print(f"[chat] Gemini response had no {tool_name} function call", file=sys.stderr)
     return None
 
 
@@ -136,6 +223,8 @@ def call_tool(*, system_prompt: str, user_message: str, tool_name: str, tool_sch
     AGENT_LLM_PROVIDER — callers don't need to know or care which is active."""
     if PROVIDER == "ollama":
         return _call_ollama(system_prompt, user_message, tool_name, tool_schema)
+    if PROVIDER == "gemini":
+        return _call_gemini(system_prompt, user_message, tool_name, tool_schema)
     if PROVIDER != "anthropic":
         print(f"[chat] unknown AGENT_LLM_PROVIDER={PROVIDER!r}, defaulting to anthropic", file=sys.stderr)
     return _call_anthropic(system_prompt, user_message, tool_name, tool_schema)
