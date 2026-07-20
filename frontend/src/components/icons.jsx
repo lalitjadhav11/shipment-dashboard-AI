@@ -157,6 +157,15 @@ export const PinIcon = (props) => (
   </svg>
 );
 
+// Filled 4-point sparkle/diamond — the AI Shipment Assistant's brand mark.
+// Breaks from the outline `base` style deliberately: sparkle glyphs read
+// better solid than stroked.
+export const SparkleIcon = (props) => (
+  <svg width={18} height={18} viewBox="0 0 24 24" fill="currentColor" {...props}>
+    <path d="M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8L12 2Z" />
+  </svg>
+);
+
 export const UploadIcon = (props) => (
   <svg {...base} width={14} height={14} {...props}>
     <path d="M12 19V5" />

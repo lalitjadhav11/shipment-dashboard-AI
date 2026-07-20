@@ -1,6 +1,7 @@
 // The nginx image proxies /api to the backend container (see nginx.conf),
 // so a relative path works both in the browser and inside Docker.
-const API_BASE = import.meta.env.VITE_API_BASE ?? "";
+// Exported so sibling service modules (e.g. agentApi.js) share one source of truth.
+export const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
 async function getJson(path) {
   const res = await fetch(`${API_BASE}${path}`);
