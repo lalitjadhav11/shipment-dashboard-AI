@@ -108,11 +108,80 @@ INTERNATIONAL_CITIES = [
     ("1 Connaught Rd", "Mumbai", None, "400001", "IN"),
 ]
 
-CONNECTING_HUBS_INTL = ["Frankfurt Hub, DE", "Memphis Gateway Hub, US", "Hong Kong Gateway Hub, HK", "Dubai Gateway Hub, AE"]
-DOMESTIC_HUBS = ["Memphis SuperHub, TN, US", "Indianapolis Hub, IN, US", "Louisville Hub, KY, US", "Oakland Sort Facility, CA, US"]
+# Coarse US region per domestic city, used to pick a geographically sensible
+# hub instead of a uniform random one (see pick_domestic_hub below). Of the 4
+# domestic hubs, only Oakland is West Coast — Memphis/Indianapolis/Louisville
+# are all central US, close enough together to treat as one interchangeable
+# "central" pool (this mirrors real carrier super-hub placement — Memphis and
+# Louisville ARE FedEx/UPS's actual central super-hub cities).
+CITY_REGION = {
+    "San Francisco": "WEST", "Seattle": "WEST", "Pasadena": "WEST",
+    "Austin": "CENTRAL", "Chicago": "CENTRAL", "Kansas City": "CENTRAL",
+    "New York": "EAST", "Atlanta": "EAST", "Washington": "EAST", "Miami": "EAST",
+}
+CENTRAL_HUBS = ["Memphis SuperHub, TN, US", "Indianapolis Hub, IN, US", "Louisville Hub, KY, US"]
+WEST_HUB = "Oakland Sort Facility, CA, US"
+
+# One connecting/gateway hub per DESTINATION country — picked once per
+# shipment and reused for every customs-adjacent stage in that journey (see
+# pick_connecting_hub). Previously each of AT_CONNECTING_HUB/CUSTOMS_HOLD/
+# CUSTOMS_CLEARED called random.choice() independently, so a single shipment
+# could visit Frankfurt, then Dubai, then Frankfurt again — customs happens
+# AT the gateway hub a shipment is already sitting at, not by bouncing to a
+# different one and back.
+CONNECTING_HUB_BY_COUNTRY = {
+    "DE": "Frankfurt Hub, DE", "GB": "Frankfurt Hub, DE", "FR": "Frankfurt Hub, DE",
+    "JP": "Hong Kong Gateway Hub, HK", "HK": "Hong Kong Gateway Hub, HK",
+    "SG": "Hong Kong Gateway Hub, HK", "AU": "Hong Kong Gateway Hub, HK",
+    "IN": "Dubai Gateway Hub, AE",
+    "CA": "Memphis Gateway Hub, US", "BR": "Memphis Gateway Hub, US",
+}
+
+
+def pick_domestic_hub(city_tuple):
+    """A hub whose region matches this city — so a journey's hub stops move
+    toward the shipment's actual direction of travel instead of randomly
+    jumping to whichever coast happens to get rolled (the original bug: an
+    Atlanta -> Seattle shipment routing through Louisville then, with equal
+    probability, Oakland OR back to a central hub with no regard for which
+    way the shipment was actually headed)."""
+    region = CITY_REGION.get(city_tuple[1], "CENTRAL")
+    if region == "WEST":
+        return WEST_HUB
+    return random.choice(CENTRAL_HUBS)
+
+
+def pick_connecting_hub(dest_tuple):
+    """The one gateway hub this international shipment clears customs
+    through, chosen by destination country/region — not a fresh random pick
+    per stage (see CONNECTING_HUB_BY_COUNTRY's docstring above)."""
+    return CONNECTING_HUB_BY_COUNTRY.get(dest_tuple[4], "Frankfurt Hub, DE")
 
 PACKAGE_TYPES = ["BOX", "ENVELOPE", "TUBE", "CRATE", "PALLET", "CUSTOM"]
 PACKAGE_SIZES = ["SMALL", "MEDIUM", "LARGE", "EXTRA_LARGE", "PALLET_SIZED"]
+
+# package_type, package_size, and package_weight_kg were three fully
+# independent random.choice()/uniform() draws — an ENVELOPE and a PALLET
+# averaged the identical ~22.5kg, and any size from SMALL to PALLET_SIZED
+# could land at 45kg or 0.2kg with equal odds. Chained instead: type ->
+# plausible size subset -> weight range for that size, so an ENVELOPE can
+# never roll PALLET_SIZED and a PALLET_SIZED item weighs like a pallet, not
+# like a phone case.
+PACKAGE_SIZES_BY_TYPE = {
+    "ENVELOPE": ["SMALL", "MEDIUM"],
+    "TUBE": ["SMALL", "MEDIUM", "LARGE"],
+    "BOX": ["SMALL", "MEDIUM", "LARGE", "EXTRA_LARGE"],
+    "CRATE": ["LARGE", "EXTRA_LARGE", "PALLET_SIZED"],
+    "PALLET": ["EXTRA_LARGE", "PALLET_SIZED"],
+    "CUSTOM": PACKAGE_SIZES,  # catch-all — genuinely anything goes
+}
+PACKAGE_WEIGHT_RANGE_KG = {
+    "SMALL": (0.1, 3.0),
+    "MEDIUM": (1.0, 10.0),
+    "LARGE": (5.0, 25.0),
+    "EXTRA_LARGE": (15.0, 45.0),
+    "PALLET_SIZED": (50.0, 500.0),
+}
 DELIVERY_TYPES_WEIGHTED = (
     ["STANDARD"] * 40 + ["EXPRESS"] * 25 + ["OVERNIGHT"] * 10 +
     ["ECONOMY"] * 15 + ["INTERNATIONAL_PRIORITY"] * 10
@@ -131,6 +200,24 @@ TRANSIT_DAYS = {
     "STANDARD": (4, 6),
     "ECONOMY": (6, 9),
     "INTERNATIONAL_PRIORITY": (5, 10),
+}
+
+# On-time probability by delivery_type — previously every tier landed at the
+# same ~75% on-time rate regardless of price/speed (scenario, which decides
+# on-time vs. late, was assigned before delivery_type and never referenced
+# it), which undersells the entire premise of paying for a faster tier: a
+# real carrier's OVERNIGHT service is watched far more tightly than ECONOMY.
+# Weighted by DELIVERY_TYPES_WEIGHTED's volume mix, this still averages to
+# ~75.8% overall — STANDARD (the largest tier by volume) is anchored at
+# exactly the original 75% baseline, so the fleet-wide on-time % barely
+# moves; only the per-tier breakdown (v_service_level_mix / the
+# service_level_mix chat template) gains real spread.
+ONTIME_PROB_BY_DELIVERY_TYPE = {
+    "OVERNIGHT": 0.92,
+    "EXPRESS": 0.82,
+    "STANDARD": 0.75,
+    "ECONOMY": 0.62,
+    "INTERNATIONAL_PRIORITY": 0.68,  # customs risk pulls this below EXPRESS despite the premium price
 }
 
 DELAY_REASONS_NON_CUSTOMS = ["WEATHER", "CIVIL_UNREST", "MECHANICAL_ISSUE", "ADDRESS_ISSUE", "OTHER"]
@@ -269,13 +356,23 @@ def build_journey(scenario: str, is_international: bool):
     raise ValueError(f"Unhandled scenario {scenario}")
 
 
-def location_for_stage(stage: str, origin, dest, is_international: bool) -> str:
+def location_for_stage(stage: str, origin, dest, is_international: bool,
+                        origin_hub: str, dest_hub: str, connecting_hub: str) -> str:
+    """origin_hub/dest_hub/connecting_hub are computed ONCE per shipment
+    (pick_domestic_hub/pick_connecting_hub, called at journey-build time) and
+    passed in here unchanged for every stage of that one journey — never
+    re-randomized per stage. That consistency is exactly what keeps a single
+    shipment's journey from revisiting unrelated hubs (Frankfurt -> Dubai ->
+    Frankfurt) or detouring through a hub facing the wrong direction (Atlanta
+    -> Seattle via a hub on the opposite coast from either city)."""
     if stage in ("LABEL_CREATED", "SHIPMENT_CREATED", "PACKAGE_RECEIVED", "TRACKING_ID_ISSUED"):
         return f"{origin[1]}, {origin[4]}"
-    if stage in ("IN_TRANSIT_TO_ORIGIN_HUB", "AT_DISTRIBUTION_HUB"):
-        return random.choice(DOMESTIC_HUBS)
+    if stage == "IN_TRANSIT_TO_ORIGIN_HUB":
+        return origin_hub
+    if stage == "AT_DISTRIBUTION_HUB":
+        return dest_hub
     if stage in ("AT_CONNECTING_HUB", "CUSTOMS_HOLD", "CUSTOMS_CLEARED"):
-        return random.choice(CONNECTING_HUBS_INTL) if is_international else random.choice(DOMESTIC_HUBS)
+        return connecting_hub if is_international else dest_hub
     if stage in ("IN_TRANSIT", "IN_TRANSIT_TO_DESTINATION_HUB"):
         return "In transit"
     if stage in ("OUT_FOR_DELIVERY", "DELIVERED", "DELIVERY_FAILED", "RETURNED_TO_SENDER"):
@@ -347,14 +444,19 @@ def generate_dataset(args, fake) -> dict:
             is_international = random.random() < 0.15
 
         origin, dest = pick_locations(is_international)
+        # Computed ONCE per shipment and reused for every matching stage below —
+        # see location_for_stage's docstring for why that consistency matters.
+        origin_hub = pick_domestic_hub(origin)
+        dest_hub = pick_domestic_hub(dest)
+        connecting_hub = pick_connecting_hub(dest) if is_international else None
 
         delivery_type = random.choice(DELIVERY_TYPES_WEIGHTED)
         if is_international and delivery_type not in ("INTERNATIONAL_PRIORITY", "STANDARD", "EXPRESS"):
             delivery_type = "INTERNATIONAL_PRIORITY"
 
         package_type = random.choice(PACKAGE_TYPES)
-        package_size = random.choice(PACKAGE_SIZES)
-        package_weight = round(random.uniform(0.2, 45.0), 3)
+        package_size = random.choice(PACKAGE_SIZES_BY_TYPE[package_type])
+        package_weight = round(random.uniform(*PACKAGE_WEIGHT_RANGE_KG[package_size]), 3)
         package_desc = random.choice(PACKAGE_DESCRIPTIONS)
 
         created_at = window_start + (window_end - window_start) * random.random()
@@ -380,19 +482,22 @@ def generate_dataset(args, fake) -> dict:
         if is_international:
             customs_status = "CLEARED"  # default; overridden per-scenario below
 
-        if scenario == "DELIVERED_ONTIME":
+        if scenario in ("DELIVERED_ONTIME", "DELIVERED_LATE"):
             current_status = "DELIVERED"
-            delivery_date = estimated_delivery - timedelta(hours=random.randint(0, 20))
-            if delivery_date < created_at:
-                delivery_date = created_at + timedelta(hours=random.randint(4, 12))
-        elif scenario == "DELIVERED_LATE":
-            current_status = "DELIVERED"
-            delay_hours = random.randint(6, 96)
-            delivery_date = estimated_delivery + timedelta(hours=delay_hours)
-            reason_for_delay = "CUSTOMS" if is_international and random.random() < 0.4 else random.choice(DELAY_REASONS_NON_CUSTOMS)
-            delay_comments = f"Delivery delayed due to {reason_for_delay.lower().replace('_', ' ')}."
-            if reason_for_delay == "CUSTOMS":
-                customs_status = "CLEARED"
+            # Re-decide on-time vs. late per shipment via ONTIME_PROB_BY_DELIVERY_TYPE
+            # rather than trusting the scenario pool's raw label directly — see that
+            # constant's docstring for why (every tier was landing at the same ~75%).
+            if random.random() < ONTIME_PROB_BY_DELIVERY_TYPE[delivery_type]:
+                delivery_date = estimated_delivery - timedelta(hours=random.randint(0, 20))
+                if delivery_date < created_at:
+                    delivery_date = created_at + timedelta(hours=random.randint(4, 12))
+            else:
+                delay_hours = random.randint(6, 96)
+                delivery_date = estimated_delivery + timedelta(hours=delay_hours)
+                reason_for_delay = "CUSTOMS" if is_international and random.random() < 0.4 else random.choice(DELAY_REASONS_NON_CUSTOMS)
+                delay_comments = f"Delivery delayed due to {reason_for_delay.lower().replace('_', ' ')}."
+                if reason_for_delay == "CUSTOMS":
+                    customs_status = "CLEARED"
         elif scenario == "CUSTOMS_HOLD":
             current_status = "CUSTOMS_HOLD"
             customs_status = "REJECTED" if random.random() < 0.15 else "HELD"
@@ -441,9 +546,24 @@ def generate_dataset(args, fake) -> dict:
                 reason_for_delay = "CUSTOMS" if (is_international and random.random() < 0.3) else random.choice(DELAY_REASONS_NON_CUSTOMS)
                 delay_comments = f"Currently tracking behind schedule due to {reason_for_delay.lower().replace('_', ' ')}."
                 estimated_delivery = max(estimated_delivery, now + timedelta(hours=random.randint(1, 72)))
-            if is_international and current_status not in ("AT_CONNECTING_HUB",):
-                customs_status = "NOT_REQUIRED" if not is_international else "PENDING"
-            if not is_international:
+            # customs_status must track the shipment's actual position relative to
+            # AT_CONNECTING_HUB in JOURNEY_STAGES, not just "is it international" —
+            # the previous version set every non-AT_CONNECTING_HUB international
+            # stage to PENDING (including LABEL_CREATED, days before the package
+            # even leaves origin) while AT_CONNECTING_HUB itself kept the default
+            # "CLEARED" set above — backwards: a shipment sitting AT the gateway
+            # hasn't cleared customs yet (that's CUSTOMS_CLEARED, a later stage),
+            # and a shipment already OUT_FOR_DELIVERY has necessarily cleared it.
+            if is_international:
+                connecting_idx = JOURNEY_STAGES.index("AT_CONNECTING_HUB")
+                stage_idx = JOURNEY_STAGES.index(current_status)
+                if stage_idx < connecting_idx:
+                    customs_status = "NOT_REQUIRED"  # not yet reached the border
+                elif stage_idx == connecting_idx:
+                    customs_status = "PENDING"  # at the gateway, awaiting processing
+                else:
+                    customs_status = "CLEARED"  # past AT_CONNECTING_HUB in the happy path
+            else:
                 customs_status = "NOT_REQUIRED"
 
         shipments.append((
@@ -471,7 +591,7 @@ def generate_dataset(args, fake) -> dict:
             ts = created_at + step * j
             tracking_events.append((
                 str(uuid.uuid4()), tracking_id, stage,
-                location_for_stage(stage, origin, dest, is_international),
+                location_for_stage(stage, origin, dest, is_international, origin_hub, dest_hub, connecting_hub),
                 ts,
                 "Auto-generated seed event",
             ))
