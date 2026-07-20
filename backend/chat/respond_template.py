@@ -76,6 +76,120 @@ def _why_is_it_late(rows: list) -> ShipmentAnswer:
     )
 
 
+def _shipment_customer_lookup(rows: list) -> ShipmentAnswer:
+    if not rows:
+        return ShipmentAnswer(
+            answer="I couldn't find a shipment with that tracking number.",
+            confidence_score=0.3,
+            supporting_data=[],
+            follow_up_suggestions=NOT_FOUND_SUGGESTIONS,
+        )
+    row = rows[0]
+    profile = row.get("customer_profile") or {}
+    contact = profile.get("contact_name")
+    answer = f"Package {row['tracking_id']} belongs to {row['org_name']} (account {row['fedex_account_id']})."
+    if contact:
+        answer += f" Account contact: {contact}."
+    return ShipmentAnswer(
+        answer=answer,
+        tracking_id=row["tracking_id"],
+        confidence_score=1.0,
+        supporting_data=row,
+    )
+
+
+def _format_loc(loc: dict | None) -> str:
+    if not loc:
+        return "an unknown location"
+    parts = [loc.get("city"), loc.get("state"), loc.get("country_code")]
+    return ", ".join(p for p in parts if p) or "an unknown location"
+
+
+def _shipment_package_details(rows: list) -> ShipmentAnswer:
+    if not rows:
+        return ShipmentAnswer(
+            answer="I couldn't find a shipment with that tracking number.",
+            confidence_score=0.3,
+            supporting_data=[],
+            follow_up_suggestions=NOT_FOUND_SUGGESTIONS,
+        )
+    row = rows[0]
+    desc = row.get("package_desc") or "no description on file"
+    weight = f"{row['package_weight_kg']} kg" if row.get("package_weight_kg") is not None else "unknown weight"
+    answer = (
+        f"Package {row['tracking_id']} is a {row['package_size']} {row['package_type']} "
+        f"({desc}), {weight}, shipped via {row['delivery_type']} service."
+    )
+    if row.get("order_id"):
+        answer += f" Order reference: {row['order_id']}."
+    return ShipmentAnswer(answer=answer, tracking_id=row["tracking_id"], confidence_score=1.0, supporting_data=row)
+
+
+def _shipment_route(rows: list) -> ShipmentAnswer:
+    if not rows:
+        return ShipmentAnswer(
+            answer="I couldn't find a shipment with that tracking number.",
+            confidence_score=0.3,
+            supporting_data=[],
+            follow_up_suggestions=NOT_FOUND_SUGGESTIONS,
+        )
+    row = rows[0]
+    origin = _format_loc(row.get("src_loc"))
+    dest = _format_loc(row.get("dest_loc"))
+    scope = "international" if row.get("is_international") else "domestic"
+    answer = f"Package {row['tracking_id']} is a {scope} shipment from {origin} to {dest}."
+    return ShipmentAnswer(answer=answer, tracking_id=row["tracking_id"], confidence_score=1.0, supporting_data=row)
+
+
+def _shipment_schedule(rows: list) -> ShipmentAnswer:
+    if not rows:
+        return ShipmentAnswer(
+            answer="I couldn't find a shipment with that tracking number.",
+            confidence_score=0.3,
+            supporting_data=[],
+            follow_up_suggestions=NOT_FOUND_SUGGESTIONS,
+        )
+    row = rows[0]
+    if row.get("pickup_date"):
+        pickup = f"scheduled for pickup on {row['pickup_date']}"
+        if row.get("pickup_window_start") and row.get("pickup_window_end"):
+            pickup += f" between {row['pickup_window_start']} and {row['pickup_window_end']}"
+    else:
+        pickup = "has no pickup scheduled"
+    answer = f"Package {row['tracking_id']} {pickup}."
+    if row.get("delivery_window_start") and row.get("delivery_window_end"):
+        answer += f" Delivery window: {row['delivery_window_start']} to {row['delivery_window_end']}."
+    answer += f" Estimated delivery: {row.get('estimated_delivery') or 'not yet available'}."
+    return ShipmentAnswer(answer=answer, tracking_id=row["tracking_id"], confidence_score=1.0, supporting_data=row)
+
+
+def _shipment_delivery_attempts(rows: list) -> ShipmentAnswer:
+    if not rows:
+        return ShipmentAnswer(
+            answer="I couldn't find a shipment with that tracking number.",
+            confidence_score=0.3,
+            supporting_data=[],
+            follow_up_suggestions=NOT_FOUND_SUGGESTIONS,
+        )
+    row = rows[0]
+    attempts = row.get("failed_delivery_attempts") or 0
+    if attempts == 0:
+        answer = f"Package {row['tracking_id']} has no failed delivery attempts (status: {row['current_status']})."
+    else:
+        answer = (
+            f"Package {row['tracking_id']} has {attempts} failed delivery attempt(s), "
+            f"last attempted {row.get('last_delivery_attempt_at') or 'at an unknown time'} "
+            f"(status: {row['current_status']})."
+        )
+    return ShipmentAnswer(
+        answer=answer,
+        tracking_id=row["tracking_id"],
+        current_status=row.get("current_status"),
+        confidence_score=1.0,
+        supporting_data=row,
+    )
+
+
 def _customs_status(rows: list) -> ShipmentAnswer:
     if not rows:
         return ShipmentAnswer(
@@ -295,9 +409,51 @@ def _failed_delivery_shipments(rows: list) -> ShipmentAnswer:
                            confidence_score=1.0, supporting_data=rows)
 
 
+def _shipments_by_location(rows: list, location: str | None) -> ShipmentAnswer:
+    where = location or "that location"
+    if not rows:
+        return ShipmentAnswer(answer=f"No shipments found going to or from {where}.",
+                               confidence_score=0.5, supporting_data=[])
+    lines = []
+    for r in rows:
+        src = (r.get("src_loc") or {}).get("city", "?")
+        dest = (r.get("dest_loc") or {}).get("city", "?")
+        lines.append(f"- {r['tracking_id']}: {r['current_status']} ({src} -> {dest})")
+    return ShipmentAnswer(answer=f"{len(rows)} shipment(s) touching {where}:\n" + "\n".join(lines),
+                           confidence_score=1.0, supporting_data=rows)
+
+
+def _shipments_by_package_size(rows: list, package_size: str | None) -> ShipmentAnswer:
+    label = package_size or "that size"
+    if not rows:
+        return ShipmentAnswer(answer=f"No {label} shipments found.", confidence_score=0.9, supporting_data=[])
+    lines = [f"- {r['tracking_id']}: {r['current_status']} ({r.get('package_type', 'unknown type')})" for r in rows]
+    return ShipmentAnswer(answer=f"{len(rows)} {label} shipment(s):\n" + "\n".join(lines),
+                           confidence_score=1.0, supporting_data=rows)
+
+
+def _shipments_by_pickup_date(rows: list, pickup_date: str | None) -> ShipmentAnswer:
+    when = pickup_date or "that date"
+    if not rows:
+        return ShipmentAnswer(answer=f"No shipments are scheduled for pickup on {when}.",
+                               confidence_score=0.9, supporting_data=[])
+    lines = [
+        f"- {r['tracking_id']}: {r['current_status']}"
+        + (f" ({r['pickup_window_start']}-{r['pickup_window_end']})" if r.get("pickup_window_start") else "")
+        for r in rows
+    ]
+    return ShipmentAnswer(answer=f"{len(rows)} shipment(s) scheduled for pickup on {when}:\n" + "\n".join(lines),
+                           confidence_score=1.0, supporting_data=rows)
+
+
 _FORMATTERS = {
     "where_is_my_package": lambda rows, entities: _where_is_my_package(rows),
     "why_is_it_late": lambda rows, entities: _why_is_it_late(rows),
+    "shipment_customer_lookup": lambda rows, entities: _shipment_customer_lookup(rows),
+    "shipment_package_details": lambda rows, entities: _shipment_package_details(rows),
+    "shipment_route": lambda rows, entities: _shipment_route(rows),
+    "shipment_schedule": lambda rows, entities: _shipment_schedule(rows),
+    "shipment_delivery_attempts": lambda rows, entities: _shipment_delivery_attempts(rows),
     "customs_status": lambda rows, entities: _customs_status(rows),
     "open_issues_for_shipment": lambda rows, entities: _open_issues_for_shipment(rows, entities.tracking_id),
     "ops_daily_briefing": lambda rows, entities: _ops_daily_briefing(rows),
@@ -316,6 +472,9 @@ _FORMATTERS = {
     "shipments_by_package_type": lambda rows, entities: _shipments_by_package_type(rows, entities.enum_matches.get("package_type")),
     "shipments_by_delivery_type": lambda rows, entities: _shipments_by_delivery_type(rows, entities.enum_matches.get("delivery_type")),
     "failed_delivery_shipments": lambda rows, entities: _failed_delivery_shipments(rows),
+    "shipments_by_location": lambda rows, entities: _shipments_by_location(rows, entities.location),
+    "shipments_by_package_size": lambda rows, entities: _shipments_by_package_size(rows, entities.enum_matches.get("package_size")),
+    "shipments_by_pickup_date": lambda rows, entities: _shipments_by_pickup_date(rows, entities.dates[0][:10] if entities.dates else None),
 }
 
 

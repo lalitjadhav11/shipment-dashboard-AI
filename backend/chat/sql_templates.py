@@ -58,6 +58,20 @@ def _org_name_params(entities):
     return {"org_name": entities.org_name}
 
 
+def _location_params(entities):
+    if not entities.location:
+        return None
+    return {"location": entities.location}
+
+
+def _pickup_date_params(entities):
+    if not entities.dates:
+        return None
+    # dateparser.parse().isoformat() (Stage 2) is a full datetime; pickup_date
+    # is a DATE column, so only the date component is a valid comparison value.
+    return {"pickup_date": entities.dates[0][:10]}
+
+
 def _enum_param_builder(field_name):
     """Factory: returns a param builder pulling one specific enum-matched
     field out of Stage 2's enum_matches dict, or None if that field wasn't
@@ -91,6 +105,59 @@ TEMPLATES = {
             SELECT tracking_id, current_status, reason_for_delay, delay_comments,
                    estimated_delivery, delivery_date, open_issue_count, journey_timeline
             FROM v_shipment_journey_summary
+            WHERE tracking_id = %(tracking_id)s
+        """,
+        required=("tracking_id",),
+    ),
+    "shipment_customer_lookup": TemplateSpec(
+        intent="shipment_customer_lookup",
+        entity_keys=("shipment", "customer"),
+        sql="""
+            SELECT s.tracking_id, c.org_name, c.fedex_account_id, c.customer_profile
+            FROM shipments s
+            JOIN customers c ON c.customer_id = s.customer_id
+            WHERE s.tracking_id = %(tracking_id)s
+        """,
+        required=("tracking_id",),
+    ),
+    "shipment_package_details": TemplateSpec(
+        intent="shipment_package_details",
+        entity_keys=("shipment",),
+        sql="""
+            SELECT tracking_id, package_type, package_desc, package_size, package_weight_kg,
+                   delivery_type, order_id
+            FROM shipments
+            WHERE tracking_id = %(tracking_id)s
+        """,
+        required=("tracking_id",),
+    ),
+    "shipment_route": TemplateSpec(
+        intent="shipment_route",
+        entity_keys=("shipment",),
+        sql="""
+            SELECT tracking_id, src_loc, dest_loc, is_international
+            FROM shipments
+            WHERE tracking_id = %(tracking_id)s
+        """,
+        required=("tracking_id",),
+    ),
+    "shipment_schedule": TemplateSpec(
+        intent="shipment_schedule",
+        entity_keys=("shipment",),
+        sql="""
+            SELECT tracking_id, pickup_date, pickup_window_start, pickup_window_end,
+                   delivery_window_start, delivery_window_end, estimated_delivery
+            FROM shipments
+            WHERE tracking_id = %(tracking_id)s
+        """,
+        required=("tracking_id",),
+    ),
+    "shipment_delivery_attempts": TemplateSpec(
+        intent="shipment_delivery_attempts",
+        entity_keys=("shipment",),
+        sql="""
+            SELECT tracking_id, current_status, failed_delivery_attempts, last_delivery_attempt_at
+            FROM shipments
             WHERE tracking_id = %(tracking_id)s
         """,
         required=("tracking_id",),
@@ -322,11 +389,56 @@ TEMPLATES = {
         """,
         required=(),
     ),
+
+    # --- Reverse lookups (3 new — the "vice versa" of the tracking_id-anchored
+    # identity templates above: filter the fleet by an attribute Stage 2 already
+    # extracted but no template previously consumed) -----------------------
+    "shipments_by_location": TemplateSpec(
+        intent="shipments_by_location",
+        entity_keys=("shipment",),
+        sql="""
+            SELECT tracking_id, current_status, src_loc, dest_loc
+            FROM shipments
+            WHERE src_loc ->> 'city' = %(location)s OR dest_loc ->> 'city' = %(location)s
+            ORDER BY created_at DESC
+            LIMIT 20
+        """,
+        required=("location",),
+    ),
+    "shipments_by_package_size": TemplateSpec(
+        intent="shipments_by_package_size",
+        entity_keys=("shipment",),
+        sql="""
+            SELECT tracking_id, current_status, package_type, package_size
+            FROM shipments
+            WHERE package_size = %(package_size)s
+            ORDER BY created_at DESC
+            LIMIT 20
+        """,
+        required=("package_size",),
+    ),
+    "shipments_by_pickup_date": TemplateSpec(
+        intent="shipments_by_pickup_date",
+        entity_keys=("shipment",),
+        sql="""
+            SELECT tracking_id, current_status, pickup_date, pickup_window_start, pickup_window_end
+            FROM shipments
+            WHERE pickup_date = %(pickup_date)s
+            ORDER BY pickup_window_start
+            LIMIT 20
+        """,
+        required=("dates",),
+    ),
 }
 
 PARAM_BUILDERS = {
     "where_is_my_package": _tracking_id_params,
     "why_is_it_late": _tracking_id_params,
+    "shipment_customer_lookup": _tracking_id_params,
+    "shipment_package_details": _tracking_id_params,
+    "shipment_route": _tracking_id_params,
+    "shipment_schedule": _tracking_id_params,
+    "shipment_delivery_attempts": _tracking_id_params,
     "customs_status": _tracking_id_params,
     "open_issues_for_shipment": _tracking_id_params,
     "ops_daily_briefing": lambda entities: {},
@@ -345,6 +457,9 @@ PARAM_BUILDERS = {
     "shipments_by_package_type": _enum_param_builder("package_type"),
     "shipments_by_delivery_type": _enum_param_builder("delivery_type"),
     "failed_delivery_shipments": lambda entities: {},
+    "shipments_by_location": _location_params,
+    "shipments_by_package_size": _enum_param_builder("package_size"),
+    "shipments_by_pickup_date": _pickup_date_params,
 }
 
 

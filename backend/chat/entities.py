@@ -9,7 +9,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-import dateparser
+from dateparser.search import search_dates
 from rapidfuzz import process, fuzz, utils as fuzz_utils
 
 from . import schema_loader
@@ -181,8 +181,15 @@ def extract_entities(query: str) -> ExtractedEntities:
         result.location = location
         result.scores[location] = location_score
 
-    parsed_date = dateparser.parse(query, settings={"PREFER_DATES_FROM": "past"})
-    if parsed_date:
-        result.dates.append(parsed_date.isoformat())
+    # dateparser.parse() (the single-value API) requires the ENTIRE input to
+    # be a date expression — it returns None for a date embedded in a normal
+    # sentence, which is every real query. search_dates() is the substring-
+    # extraction API. languages=["en"] matters: without it, dateparser tries
+    # every locale it ships and produced a false-positive match on the bare
+    # word "me" (interpreted as a date in some non-English locale) inside an
+    # unrelated query ("Show me all our large shipments").
+    found_dates = search_dates(query, languages=["en"], settings={"PREFER_DATES_FROM": "past"})
+    if found_dates:
+        result.dates = [d.isoformat() for _, d in found_dates]
 
     return result

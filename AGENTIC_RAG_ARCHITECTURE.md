@@ -59,11 +59,14 @@ top of an already-working, already-tested backbone.
 | LLM calls per request | **0** | 0 for the 6 known intents (unchanged); up to 2 only when Stage 4b fires |
 | New dependency | `sentence-transformers`, `rapidfuzz`, `dateparser`, `sqlglot`, `asyncpg`, `sse-starlette` | + Anthropic SDK |
 
-v0 already covers the majority of expected traffic — **20** `query_patterns` intents now
+v0 already covers the majority of expected traffic — **28** `query_patterns` intents now
 defined in the schema JSON (originally 6; expanded per §10 to cover every dashboard view plus
 genuine mix-and-match filters — by customer, status, package type, delivery type, and joined
-customer+delay combinations) — end to end, fully guardrailed, fully testable, with deterministic
-output. v1 only extends coverage to ad-hoc/analytical phrasing that Stage 4a structurally can't
+customer+delay combinations — then per §12 to cover single-shipment identity lookups (who owns
+it, package/service details, route, schedule, delivery attempts) and their reverse — filter the
+fleet by location, package size, or pickup date) — end to end, fully guardrailed, fully
+testable, with deterministic output. v1 only extends coverage to ad-hoc/analytical phrasing that
+Stage 4a structurally can't
 template; it does not touch Stages 1-3, 5, or 6, and — per the routing above — it doesn't touch
 the response path for any of the 20 known intents either.
 
@@ -789,3 +792,118 @@ call succeeds every time — that's the pre-existing, separately-documented reli
 §9, unaffected by and orthogonal to this fix. Full regression (all 20 templates' core paths,
 multi-ID guard, not-found handling, DB write guardrail, `/health`) re-run clean, 0 backend
 errors.
+
+## 12. Template library expansion: 20 → 25, plus two embedding-collision fixes
+
+Live query while testing the new frontend chat panel: *"who is the customer for 800000000010"*.
+Routing looked plausible (a tracking_id present, Stage 1 matched *something* above threshold)
+but the answer was **confidently wrong** — `where_is_my_package` (0.452 confidence) answered
+with current status, never mentioning the customer at all, because **no template existed** for
+"who owns this shipment." Unlike §11's bug, this wasn't a routing-logic defect — the classifier
+did exactly what it's supposed to do (pick the closest match above threshold); the fix is a
+missing *destination* to route to, not a fix to the routing rule.
+
+**Audited the full `shipments`/`customers` schema for the same shape of gap** — a single-
+tracking-id "identity" question with no template — and found four more: package contents/
+service level, origin/destination, pickup/delivery scheduling, and failed-delivery-attempt
+history. All were previously only reachable (if at all) by accidentally matching an unrelated
+template, exactly like the customer-lookup case. Added five new zero-LLM templates, each
+`required=("tracking_id",)`, each wired through Stage 4a → Stage 5 (guardrail, allow-listed
+against the existing `shipment`/`customer` entity fields — no schema changes needed) → Stage 7's
+template formatter:
+
+| Intent | Answers | Entities touched |
+|---|---|---|
+| `shipment_customer_lookup` | Which customer owns this shipment (org name, account ID, contact) | `shipment`, `customer` |
+| `shipment_package_details` | Package type/size/weight/description, service level, order ID | `shipment` |
+| `shipment_route` | Origin and destination (city/state/country), domestic vs. international | `shipment` |
+| `shipment_schedule` | Pickup date/window, delivery window, ETA | `shipment` |
+| `shipment_delivery_attempts` | Failed delivery attempt count and last attempt time | `shipment` |
+
+**Two embedding-collision bugs surfaced during regression, both fixed by rewording
+`example_nl`** (the fix is always data, in `02_phase1_agentic_schema.json`, never code — see §1's
+"growing the intent set is a JSON edit" principle):
+
+1. `top_customers_by_volume` lost to `daily_volume_trend` for *"show me top customers by
+   volume"* (0.529 vs. unmeasured-but-lower) — its example (`"Who are our top shippers and
+   how's their on-time rate?"`) never used the words "customers" or "volume" that the intent's
+   own name implies users will actually type. Reworded to `"Show me our top customers by
+   shipment volume and their on-time rate."` → now wins at 0.775, `daily_volume_trend` unaffected
+   (0.697–0.971 across its own paraphrases).
+2. `shipment_package_details` lost to `shipment_customer_lookup` for *"What delivery service is
+   tracking number X using?"* (0.765 vs 0.642) even after one rewording attempt — trailing
+   clauses ("...and how much does it weigh?") measurably *diluted* the match rather than
+   strengthening it. Root cause: `all-MiniLM-L6-v2` at these short lengths is weighing sentence
+   *structure* as much as specific nouns, so a compound multi-clause example splits its own
+   similarity mass across all the things it mentions. Fixed by leading with the exact phrase
+   most likely to appear in a real query (`"What delivery service level and package type is
+   tracking number X using?"`) and cutting the trailing clause — verified against both the
+   original failing query (0.830, now #1) and a previously-untested short paraphrase ("What kind
+   of package is X?", 0.602, now #1) using the same rewording, confirming the fix generalizes
+   rather than overfitting to one exact sentence.
+
+**Methodology note for future template/intent additions:** don't just eyeball an `example_nl`
+and hope — use `intent.rank_intents(query)` directly (`docker exec <backend> python -c
+"from chat import intent; ..."`) to see the full ranked list and exact scores before and after a
+wording change. This turned what would have been trial-and-error against the live HTTP endpoint
+into a fast, deterministic offline loop (embeddings are pure functions of the text — no DB, no
+pipeline, no LLM call needed to iterate).
+
+Verified end to end (not just `rank_intents` scores): all 5 new templates' canonical phrasings
+return correct, well-formed answers via `/api/chat` through the nginx proxy — including the
+originally-reported query. Full regression re-run: all 12 tracking-id-anchored intents
+(`where_is_my_package`, `why_is_it_late`, `customs_status`, `open_issues_for_shipment`, and the
+5 new ones, plus 3 unrelated fleet-wide intents used as distractors) classify to the correct
+intent with confidence comfortably clear of the runner-up. Template count: 20 → 25.
+
+### 12.1 The other half: reverse lookups, and a latent Stage 2 bug they exposed
+
+Five new templates all answer "given a tracking_id, what's its X" — the natural next question
+is "vice versa": given X, which shipments match? Checked each of the five against the existing
+19 templates:
+
+| Forward (tracking_id → X) | Reverse (X → shipments) | Status |
+|---|---|---|
+| `shipment_customer_lookup` | `shipments_by_customer` | already existed |
+| `shipment_package_details` (type, service) | `shipments_by_package_type`, `shipments_by_delivery_type` | already existed |
+| `shipment_delivery_attempts` | `failed_delivery_shipments` | already existed |
+| `shipment_route` (origin/destination) | — | **missing** |
+| `shipment_package_details` (size) | — | **missing** (only `package_type` had a filter, not `package_size`) |
+| `shipment_schedule` (pickup date) | — | **missing** |
+
+The first three "already existed" because §10's mix-and-match expansion happened to cover them.
+The last three are genuine gaps — and notably, `entities.py` (Stage 2) already extracts
+`location` and `dates` on every query (has since an earlier session), but **no template had ever
+consumed either field** — they were computed, included in the trace, and then silently unused.
+Added three more zero-LLM templates to close this:
+
+| Intent | Filters on | Param source |
+|---|---|---|
+| `shipments_by_location` | `src_loc->>'city'` or `dest_loc->>'city'` | `entities.location` (already extracted, previously unused) |
+| `shipments_by_package_size` | `package_size` | `entities.enum_matches["package_size"]` (already extracted, previously unused as a filter) |
+| `shipments_by_pickup_date` | `pickup_date` | `entities.dates[0]` (already extracted, previously unused) |
+
+**Wiring up `shipments_by_pickup_date` exposed a real, previously-latent Stage 2 bug**: the query
+*"Which shipments are scheduled for pickup on July 17th?"* classified correctly
+(`shipments_by_pickup_date`, confidence 0.966) but `entities.dates` came back empty, so the
+template's required param was missing and it silently fell through to the (slow, Ollama-backed)
+Stage 4b path instead. Root cause: `entities.py` was calling `dateparser.parse(query, ...)` —
+that function requires **the entire input string** to be a date expression and returns `None`
+for a date embedded in a normal sentence, which is every real query. It happened to work
+whenever tested in isolation (`"July 17th"` alone) and had silently returned `None` for every
+*real* query, forever — invisible until now because nothing had ever consumed `entities.dates`
+before this template. Fixed by switching to `dateparser.search.search_dates()`, the substring-
+extraction API. That introduced its own false positive on first pass — `languages` unset makes
+`search_dates` try every locale dateparser ships, and it matched the bare word "me" as a date
+(some non-English locale's format) inside *"Show me all our large shipments"*, unrelated to any
+date question. Fixed by pinning `languages=["en"]`, verified against both the original bug query
+and the false-positive query, plus a spot-check of relative dates ("tomorrow", "yesterday") and
+several unrelated tracking-id queries (no spurious matches).
+
+Verified end to end: all three new templates return correct results via `/api/chat`
+(`shipments_by_location` for "Seattle" — 20 rows, correctly matching either leg of the route;
+`shipments_by_package_size` for "large and extra-large" — fuzzy-matches to `LARGE`, consistent
+with the existing single-best-match enum design elsewhere; `shipments_by_pickup_date` for "July
+17th" — 20 rows, all `pickup_date = 2026-07-17`). Full regression re-run across all 15
+tracking-id, reverse-lookup, and fleet-wide intents from this and §12's first half — all correct,
+0 backend errors. Template count: **25 → 28**.

@@ -34,6 +34,36 @@
         "example_nl": "Why is my shipment delayed?"
       },
       {
+        "intent": "shipment_customer_lookup",
+        "entities": ["shipment", "customer"],
+        "recommended_query": "SELECT c.org_name, c.fedex_account_id, c.customer_profile FROM shipments s JOIN customers c ON c.customer_id = s.customer_id WHERE s.tracking_id = $1;",
+        "example_nl": "Who is the customer for tracking number 794658312457?"
+      },
+      {
+        "intent": "shipment_package_details",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT tracking_id, package_type, package_desc, package_size, package_weight_kg, delivery_type, order_id FROM shipments WHERE tracking_id = $1;",
+        "example_nl": "What delivery service level and package type is tracking number 794658312457 using?"
+      },
+      {
+        "intent": "shipment_route",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT tracking_id, src_loc, dest_loc, is_international FROM shipments WHERE tracking_id = $1;",
+        "example_nl": "Where is my shipment 794658312457 coming from and where is it going?"
+      },
+      {
+        "intent": "shipment_schedule",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT tracking_id, pickup_date, pickup_window_start, pickup_window_end, delivery_window_start, delivery_window_end, estimated_delivery FROM shipments WHERE tracking_id = $1;",
+        "example_nl": "When will my package 794658312457 be picked up, and what's the delivery window?"
+      },
+      {
+        "intent": "shipment_delivery_attempts",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT tracking_id, current_status, failed_delivery_attempts, last_delivery_attempt_at FROM shipments WHERE tracking_id = $1;",
+        "example_nl": "Has tracking number 794658312457 had any failed delivery attempts?"
+      },
+      {
         "intent": "customs_status",
         "entities": ["shipment"],
         "recommended_query": "SELECT customs_status, is_international FROM shipments WHERE tracking_id = $1;",
@@ -55,7 +85,7 @@
         "intent": "top_customers_by_volume",
         "entities": ["customer", "shipment"],
         "recommended_query": "SELECT * FROM v_top_customers;",
-        "example_nl": "Who are our top shippers and how's their on-time rate?"
+        "example_nl": "Show me our top customers by shipment volume and their on-time rate."
       },
       {
         "intent": "dashboard_headline",
@@ -140,6 +170,24 @@
         "entities": ["shipment"],
         "recommended_query": "SELECT * FROM shipments WHERE failed_delivery_attempts > 0 ORDER BY failed_delivery_attempts DESC LIMIT 20;",
         "example_nl": "Which shipments have had failed delivery attempts?"
+      },
+      {
+        "intent": "shipments_by_location",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT * FROM shipments WHERE src_loc->>'city' = $1 OR dest_loc->>'city' = $1 ORDER BY created_at DESC LIMIT 20;",
+        "example_nl": "Which shipments are going to or coming from Seattle?"
+      },
+      {
+        "intent": "shipments_by_package_size",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT * FROM shipments WHERE package_size = $1 ORDER BY created_at DESC LIMIT 20;",
+        "example_nl": "Show me all our large and extra-large shipments."
+      },
+      {
+        "intent": "shipments_by_pickup_date",
+        "entities": ["shipment"],
+        "recommended_query": "SELECT * FROM shipments WHERE pickup_date = $1 ORDER BY pickup_window_start LIMIT 20;",
+        "example_nl": "Which shipments are scheduled for pickup on July 20th?"
       }
     ]
   },
