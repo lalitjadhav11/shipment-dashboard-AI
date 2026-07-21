@@ -1448,3 +1448,47 @@ reported issue exposed a pre-existing false-positive one layer up (the regex), a
 fix exposed a genuinely independent reliability gap one layer down (the empty-answer guard) —
 neither would have surfaced without actually running the fix against live data and a real
 regression set, not just reasoning about the change in isolation.
+
+## 19. "Transit count is different" — traced, found accurate, but exposed a masked routing bug
+
+Reported as a possible data-consistency issue: *"show me all orders which in transit"* answered
+*"3,250 shipments currently in transit"* — asked to trace the query and execution to check the
+number. Verified all three independent sources agree exactly: raw `SELECT count(*) FROM
+shipments WHERE current_status = 'IN_TRANSIT'` → 3250; `v_status_breakdown`'s own row → 3250;
+the query's own `COUNT(*) OVER() AS total_count` (§17) → 3250. No data-consistency bug — the
+number itself was correct everywhere it was checked.
+
+**But the trace exposed a real routing bug hiding behind a lucky recovery.** `shipments_by_status`
+— the obviously-correct template — never even got considered: Stage 1 matched
+`shipments_by_delivery_type` (0.409), which requires `delivery_type` (never extracted here), so
+it failed to fill and fell through to Stage 4b. Stage 4b's LLM happened to notice the
+already-extracted `current_status=IN_TRANSIT` param and correctly reconstructed equivalent SQL
+from scratch — so the answer came out right, but via an LLM round-trip instead of the free,
+instant v0 template, and only because this specific LLM call happened to recover well. A
+different provider, model, or unlucky roll could easily have produced a wrong or empty answer
+instead (§18 just demonstrated the empty-answer failure mode directly).
+
+Root cause: `shipments_by_status`'s example (`"Give me 5 shipments that currently have status
+customs hold."`) was anchored to one concrete status (tuned in §13 specifically to beat
+`status_breakdown` for a customs-flavored query) and didn't generalize to `"orders...in
+transit"` — different noun ("orders" vs "shipments"), different status value, different
+sentence shape. Reworded to `"Show me shipments or orders with a specific status, like customs
+hold or in transit."` — deliberately keeping *both* concrete status words from the phrasings
+that have already needed fixes, plus the "orders" synonym, so the sentence anchors to the general
+pattern ("a specific status, whichever one") rather than over-fitting to a single example status
+again. Verified against the full standing regression set before committing, not just the new bug
+query: `shipments_by_status` now wins its own case (0.532, was 0.352) and still safely wins the
+§13 customs case (0.654 vs `status_breakdown`'s 0.565) — while `customs_status`, `status_breakdown`,
+and `shipments_by_delivery_type` all still correctly win their own queries by comfortable margins
+(0.712, 0.734, 0.970 respectively).
+
+Verified end to end: the query now resolves directly to `shipments_by_status` (0.532, source:
+`"template"` not `"llm"`) and answers *"20 of 3250 shipment(s) with status IN_TRANSIT"* —
+instant, free, and using the exact same `total_count` mechanism (§17) that already proved the
+number itself was never wrong.
+
+**Recurring theme, worth naming plainly:** an LLM recovering gracefully from a routing failure is
+not the same as the routing being correct — it just means the failure didn't surface *this time*.
+Several sections in this document (§15's causal gate, §18's aggregate gate, and now this one) are
+all instances of the same lesson: don't stop investigating a "the answer looks right" report just
+because the answer looks right — check *how* it got there.
