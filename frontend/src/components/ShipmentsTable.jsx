@@ -4,7 +4,7 @@ import { titleCase, formatDestination, formatTimestamp } from "../format.js";
 import StatusBadge from "./StatusBadge.jsx";
 import Pagination from "./Pagination.jsx";
 import ShipmentDetailDrawer from "./ShipmentDetailDrawer.jsx";
-import { SearchIcon, FilterIcon, SortArrow } from "./icons.jsx";
+import { SearchIcon, FilterIcon, SortArrow, SparkleIcon } from "./icons.jsx";
 
 const PAGE_SIZE = 50;
 
@@ -41,7 +41,9 @@ export default function ShipmentsTable() {
   const [isInternational, setIsInternational] = useState("");
   const [sortBy, setSortBy] = useState("last_modified");
   const [sortDir, setSortDir] = useState("desc");
-  const [selectedTrackingId, setSelectedTrackingId] = useState(null);
+  // { trackingId, autoAiSummary } — autoAiSummary is only true when opened via
+  // the AI diamond, so the drawer only spends an LLM call when asked to.
+  const [selection, setSelection] = useState(null);
 
   // Debounce free-text search so we don't fire a request per keystroke.
   useEffect(() => {
@@ -214,9 +216,18 @@ export default function ShipmentsTable() {
                   <button
                     type="button"
                     className="catalog-table__link"
-                    onClick={() => setSelectedTrackingId(row.tracking_id)}
+                    onClick={() => setSelection({ trackingId: row.tracking_id, autoAiSummary: false })}
                   >
                     {row.tracking_id}
+                  </button>
+                  <button
+                    type="button"
+                    className="catalog-table__ai-diamond"
+                    title="AI summary"
+                    aria-label={`Get an AI summary for shipment ${row.tracking_id}`}
+                    onClick={() => setSelection({ trackingId: row.tracking_id, autoAiSummary: true })}
+                  >
+                    <SparkleIcon width={13} height={13} />
                   </button>
                 </td>
                 <td>{row.org_name}</td>
@@ -238,8 +249,9 @@ export default function ShipmentsTable() {
       </div>
 
       <ShipmentDetailDrawer
-        trackingId={selectedTrackingId}
-        onClose={() => setSelectedTrackingId(null)}
+        trackingId={selection?.trackingId ?? null}
+        autoAiSummary={selection?.autoAiSummary ?? false}
+        onClose={() => setSelection(null)}
       />
     </section>
   );
