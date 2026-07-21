@@ -1,15 +1,4 @@
-import { useState } from "react";
-import { SearchIcon } from "./icons.jsx";
-
-export default function TopBar({ value = "", onAsk }) {
-  const [input, setInput] = useState(value);
-
-  function handleSubmit(event) {
-    event.preventDefault();
-    const trimmed = input.trim();
-    if (trimmed) onAsk?.(trimmed);
-  }
-
+export default function TopBar() {
   return (
     <header className="topbar">
       <div className="topbar__logo" aria-label="Shipment Dashboard">
@@ -17,18 +6,7 @@ export default function TopBar({ value = "", onAsk }) {
         <span className="topbar__logo-track">Track</span>
       </div>
 
-      <form className="topbar__search" onSubmit={handleSubmit}>
-        <input
-          type="text"
-          placeholder="Ask the AI assistant about your shipments…"
-          aria-label="Ask the AI assistant"
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-        />
-        <button type="submit" aria-label="Ask">
-          <SearchIcon width={16} height={16} />
-        </button>
-      </form>
+      <div className="topbar__spacer" />
 
       <div className="topbar__account">
         <span className="topbar__avatar">C</span>
