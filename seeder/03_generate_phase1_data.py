@@ -232,6 +232,70 @@ ISSUE_TYPE_BY_DELAY_REASON = {
     "OTHER": "OTHER",
 }
 
+# "Resolved with a specific, valid reason" catalogs — used by the
+# CUSTOMS_HOLD_RESOLVED_VALID and DELAY_RESOLVED_VALID scenarios below to
+# produce a realistic, non-generic incident narrative (a real customs hold
+# reason + what the carrier/broker actually needed, not just "held for
+# customs"). Each entry's text is written into tracking_events.notes itself
+# (via note_for_stage's override_notes param), not just shipment_issues.
+# description — so the specific reason is visible in the journey history,
+# exactly where a support agent or the chat assistant would look for it.
+CUSTOMS_HOLD_VALID_REASONS = [
+    ("missing HS (Harmonized System) code on the customs declaration",
+     "Corrected HS code submitted by the shipper's customs broker"),
+    ("a mismatch between the commercial invoice value and the declared goods",
+     "Amended commercial invoice provided and verified"),
+    ("a missing certificate of origin required for preferential duty treatment",
+     "Certificate of origin submitted by the exporter"),
+    ("an import permit/license required for a restricted item category",
+     "Import permit obtained and submitted by the recipient"),
+    ("incomplete customs declaration paperwork",
+     "Complete declaration paperwork resubmitted by the broker"),
+    ("missing regulatory compliance documentation (FDA/FCC) for the product",
+     "Compliance certificate provided by the manufacturer"),
+    ("the recipient's tax ID (EORI/GSTIN) not being provided on the declaration",
+     "Recipient's tax ID confirmed and added to the declaration"),
+    ("duties and taxes payment pending confirmation",
+     "Duties and taxes payment confirmed by the broker"),
+    ("the shipment being selected for a random customs inspection",
+     "Inspection completed with no discrepancies found"),
+    ("a goods description too vague for tariff classification",
+     "Detailed goods description and tariff classification supplied"),
+]
+
+DELAY_VALID_REASONS = {
+    "WEATHER": [
+        "a severe winter storm grounding flights at the origin hub",
+        "regional flooding disrupting ground transport routes",
+        "a hurricane warning suspending outbound shipments temporarily",
+    ],
+    "MECHANICAL_ISSUE": [
+        "the delivery vehicle breaking down en route to the hub",
+        "a sorting equipment outage at the distribution hub",
+        "an aircraft mechanical inspection delaying the scheduled flight",
+    ],
+    "ADDRESS_ISSUE": [
+        "an incomplete recipient address requiring verification",
+        "a missing apartment/unit number on the delivery address",
+        "a delivery address that could not be geocoded and needed manual correction",
+    ],
+    "CIVIL_UNREST": [
+        "regional protests temporarily blocking the delivery route",
+        "a local curfew delaying the scheduled delivery run",
+    ],
+    "OTHER": [
+        "a hub capacity overload requiring the package to be rerouted",
+        "manual re-labeling required after a damaged shipping label",
+    ],
+}
+RESOLUTION_PHRASE_BY_REASON = {
+    "WEATHER": "Weather conditions cleared",
+    "MECHANICAL_ISSUE": "Equipment repaired and back in service",
+    "ADDRESS_ISSUE": "Correct address confirmed with the recipient",
+    "CIVIL_UNREST": "Route reopened and confirmed safe",
+    "OTHER": "Issue resolved",
+}
+
 # Full happy-path journey stage order (used to build partial/complete timelines)
 JOURNEY_STAGES = [
     "LABEL_CREATED", "SHIPMENT_CREATED", "PACKAGE_RECEIVED", "TRACKING_ID_ISSUED",
@@ -243,7 +307,7 @@ JOURNEY_STAGES = [
 # Scenario quota: exact allocation across 25,000 shipments guarantees coverage
 # of every enum value (see docstring). Scale factor applied if --shipments != 25000.
 SCENARIO_QUOTA_AT_25000 = {
-    "DELIVERED_ONTIME": 10500,
+    "DELIVERED_ONTIME": 10300,  # was 10500; 200 carved out for the two scenarios below
     "DELIVERED_LATE": 3500,
     "IN_TRANSIT": 3250,
     "AT_DISTRIBUTION_HUB": 1000,
@@ -261,6 +325,13 @@ SCENARIO_QUOTA_AT_25000 = {
     "RETURNED_TO_SENDER": 200,
     "LOST": 100,
     "CANCELLED": 200,
+    # Held at customs for a specific, valid reason (missing HS code,
+    # incomplete paperwork, etc.), then resolved once the required detail was
+    # provided to FedEx/UPS — always RESOLVED, never left stuck.
+    "CUSTOMS_HOLD_RESOLVED_VALID": 100,
+    # Same "resolved with a specific valid reason" treatment for non-customs
+    # delays (weather / mechanical / address / civil unrest).
+    "DELAY_RESOLVED_VALID": 100,
 }
 assert sum(SCENARIO_QUOTA_AT_25000.values()) == 25000
 
@@ -382,7 +453,8 @@ def location_for_stage(stage: str, origin, dest, is_international: bool,
     return "Unknown"
 
 
-def note_for_stage(stage: str, reason_for_delay: str, delay_comments: str | None) -> str:
+def note_for_stage(stage: str, reason_for_delay: str, delay_comments: str | None,
+                    override_notes: dict | None = None) -> str:
     """CUSTOMS_HOLD/CUSTOMS_CLEARED are standard sub-stages build_journey()
     splices into EVERY international shipment's journey — the customs
     checkpoint every international package passes through, not by itself a
@@ -396,7 +468,15 @@ def note_for_stage(stage: str, reason_for_delay: str, delay_comments: str | None
     journey itself: an actual incident (reason_for_delay == 'CUSTOMS') gets
     the real delay_comments text; the routine checkpoint gets an explicit
     'no issues' note instead of the generic placeholder every other stage
-    still uses."""
+    still uses.
+
+    override_notes: an optional {stage_name: note_text} map for scenarios
+    that need two DIFFERENT specific notes across one journey (e.g. the
+    actual hold reason on CUSTOMS_HOLD, and a distinct resolution note on
+    CUSTOMS_CLEARED) rather than the single shared delay_comments text every
+    other scenario reuses verbatim on both stages."""
+    if override_notes and stage in override_notes:
+        return override_notes[stage]
     if stage in ("CUSTOMS_HOLD", "CUSTOMS_CLEARED"):
         if reason_for_delay == "CUSTOMS" and delay_comments:
             return delay_comments
@@ -458,7 +538,7 @@ def generate_dataset(args, fake) -> dict:
         customer_id = customer[0]
 
         # International forced true for customs scenarios; ~18% baseline otherwise
-        if scenario in ("CUSTOMS_HOLD", "CUSTOMS_CLEARED"):
+        if scenario in ("CUSTOMS_HOLD", "CUSTOMS_CLEARED", "CUSTOMS_HOLD_RESOLVED_VALID"):
             is_international = True
         elif scenario in ("DELIVERED_ONTIME", "DELIVERED_LATE", "DELIVERY_FAILED", "RETURNED_TO_SENDER"):
             is_international = random.random() < 0.22
@@ -500,6 +580,10 @@ def generate_dataset(args, fake) -> dict:
         delivery_window_start = None
         delivery_window_end = None
         current_status = None
+        final_status = None
+        stage_note_overrides = None
+        specific_reason = None
+        resolution_phrase = None
 
         if is_international:
             customs_status = "CLEARED"  # default; overridden per-scenario below
@@ -517,9 +601,17 @@ def generate_dataset(args, fake) -> dict:
                 delay_hours = random.randint(6, 96)
                 delivery_date = estimated_delivery + timedelta(hours=delay_hours)
                 reason_for_delay = "CUSTOMS" if is_international and random.random() < 0.4 else random.choice(DELAY_REASONS_NON_CUSTOMS)
-                delay_comments = f"Delivery delayed due to {reason_for_delay.lower().replace('_', ' ')}."
+                # Specific catalog reason instead of a bare enum name — same
+                # "valid reason mentioned in the comments" treatment as the
+                # two dedicated scenarios above, applied here too since this
+                # branch (delivered late) is one of the largest delay buckets.
                 if reason_for_delay == "CUSTOMS":
+                    specific, _resolution = random.choice(CUSTOMS_HOLD_VALID_REASONS)
+                    delay_comments = f"Delivery delayed: held at customs due to {specific}; cleared prior to final delivery."
                     customs_status = "CLEARED"
+                else:
+                    specific = random.choice(DELAY_VALID_REASONS.get(reason_for_delay, ["an operational delay"]))
+                    delay_comments = f"Delivery delayed due to {specific}."
         elif scenario == "CUSTOMS_HOLD":
             current_status = "CUSTOMS_HOLD"
             customs_status = "REJECTED" if random.random() < 0.15 else "HELD"
@@ -560,13 +652,74 @@ def generate_dataset(args, fake) -> dict:
             reason_for_delay = "NONE"
             comments = "Cancelled by customer before pickup."
             customs_status = "NOT_REQUIRED"
+        elif scenario == "CUSTOMS_HOLD_RESOLVED_VALID":
+            # Genuinely held at customs for a specific, valid reason (missing
+            # HS code, incomplete paperwork, etc.) — then resolved once the
+            # shipper/recipient supplied what FedEx/UPS's broker asked for.
+            # Unlike the generic CUSTOMS_HOLD scenario (still stuck) or the
+            # ~35%-of-mid-journey coin-flip resolution further below (generic
+            # reason text), this scenario is ALWAYS resolved and ALWAYS
+            # carries the specific reason in both shipment_issues.description
+            # and the CUSTOMS_HOLD/CUSTOMS_CLEARED tracking_events.notes
+            # themselves (see stage_note_overrides, applied further down).
+            hold_reason, resolution_action = random.choice(CUSTOMS_HOLD_VALID_REASONS)
+            carrier = random.choice(["FedEx", "UPS"])
+            final_status = random.choices(
+                ["CUSTOMS_CLEARED", "IN_TRANSIT_TO_DESTINATION_HUB", "OUT_FOR_DELIVERY", "DELIVERED"],
+                weights=[35, 30, 20, 15], k=1,
+            )[0]
+            current_status = final_status
+            customs_status = "CLEARED"
+            reason_for_delay = "CUSTOMS"
+            hold_note = f"Held at customs due to {hold_reason}."
+            resolution_note = f"{resolution_action} to {carrier}; customs hold released and shipment cleared to proceed."
+            delay_comments = f"{hold_note} {resolution_note}"
+            stage_note_overrides = {"CUSTOMS_HOLD": hold_note, "CUSTOMS_CLEARED": resolution_note}
+            estimated_delivery = max(estimated_delivery, now + timedelta(days=random.randint(1, 5)))
+            if final_status == "DELIVERED":
+                delivery_date = estimated_delivery - timedelta(hours=random.randint(0, 20))
+                if delivery_date < created_at:
+                    delivery_date = created_at + timedelta(hours=random.randint(12, 48))
+        elif scenario == "DELAY_RESOLVED_VALID":
+            # Same idea for non-customs delays: weather / mechanical / address
+            # / civil-unrest / other, always resolved, always a specific
+            # reason — applied to whichever stage the delay actually
+            # happened at and the stage it resumed moving from (computed once
+            # the journey's stage list is built, further down).
+            reason_for_delay = random.choice(["WEATHER", "MECHANICAL_ISSUE", "ADDRESS_ISSUE", "CIVIL_UNREST", "OTHER"])
+            specific_reason = random.choice(DELAY_VALID_REASONS[reason_for_delay])
+            resolution_phrase = RESOLUTION_PHRASE_BY_REASON[reason_for_delay]
+            final_status = random.choices(
+                ["IN_TRANSIT", "AT_DISTRIBUTION_HUB", "OUT_FOR_DELIVERY", "DELIVERED"],
+                weights=[25, 25, 25, 25], k=1,
+            )[0]
+            current_status = final_status
+            delay_comments = (
+                f"Delayed due to {specific_reason}. {resolution_phrase}; "
+                f"shipment released and proceeding as scheduled."
+            )
+            estimated_delivery = max(estimated_delivery, now + timedelta(hours=random.randint(6, 72)))
+            if final_status == "DELIVERED":
+                delivery_date = estimated_delivery - timedelta(hours=random.randint(0, 12))
+                if delivery_date < created_at:
+                    delivery_date = created_at + timedelta(hours=random.randint(12, 48))
         else:
             # Generic mid-journey "currently in progress" statuses
             current_status = scenario
             # ~12% of in-progress shipments are running behind schedule right now
             if random.random() < 0.12:
                 reason_for_delay = "CUSTOMS" if (is_international and random.random() < 0.3) else random.choice(DELAY_REASONS_NON_CUSTOMS)
-                delay_comments = f"Currently tracking behind schedule due to {reason_for_delay.lower().replace('_', ' ')}."
+                # Specific catalog reason rather than a bare enum name — this
+                # text also becomes shipment_issues.description for whichever
+                # of these later get marked RESOLVED (~35% below), so the
+                # "resolved with a specific valid reason" narrative applies
+                # fleet-wide, not just to the two dedicated scenarios above.
+                if reason_for_delay == "CUSTOMS":
+                    specific, _resolution = random.choice(CUSTOMS_HOLD_VALID_REASONS)
+                    delay_comments = f"Currently tracking behind schedule: held at customs due to {specific}."
+                else:
+                    specific = random.choice(DELAY_VALID_REASONS.get(reason_for_delay, ["an operational delay"]))
+                    delay_comments = f"Currently tracking behind schedule due to {specific}."
                 estimated_delivery = max(estimated_delivery, now + timedelta(hours=random.randint(1, 72)))
             # customs_status must track the shipment's actual position relative to
             # AT_CONNECTING_HUB in JOURNEY_STAGES, not just "is it international" —
@@ -604,7 +757,19 @@ def generate_dataset(args, fake) -> dict:
         ))
 
         # ---- tracking_events journey ----
-        journey = build_journey(scenario, is_international)
+        # CUSTOMS_HOLD_RESOLVED_VALID/DELAY_RESOLVED_VALID aren't real
+        # JOURNEY_STAGES entries themselves — they're scenario labels that
+        # also picked a real final_status stage (e.g. "OUT_FOR_DELIVERY")
+        # above for this shipment to currently sit at; build_journey needs
+        # that real stage name, not the scenario label, to build the correct
+        # stage-prefix list.
+        journey_scenario = final_status if final_status else scenario
+        journey = build_journey(journey_scenario, is_international)
+        if scenario == "DELAY_RESOLVED_VALID" and len(journey) >= 2:
+            stage_note_overrides = {
+                journey[-2]: f"Delayed due to {specific_reason}.",
+                journey[-1]: f"{resolution_phrase}; shipment released and proceeding as scheduled.",
+            }
         span_end = delivery_date or last_attempt_at or min(now, estimated_delivery)
         if span_end <= created_at:
             span_end = created_at + timedelta(hours=len(journey) * 4)
@@ -615,17 +780,27 @@ def generate_dataset(args, fake) -> dict:
                 str(uuid.uuid4()), tracking_id, stage,
                 location_for_stage(stage, origin, dest, is_international, origin_hub, dest_hub, connecting_hub),
                 ts,
-                note_for_stage(stage, reason_for_delay, delay_comments),
+                note_for_stage(stage, reason_for_delay, delay_comments, stage_note_overrides),
             ))
 
         # ---- shipment_issues ----
         if reason_for_delay != "NONE":
             if scenario in ("DELIVERY_FAILED", "RETURNED_TO_SENDER"):
                 issue_type = "FAILED_DELIVERY_ATTEMPT"
+            elif scenario == "CUSTOMS_HOLD_RESOLVED_VALID":
+                issue_type = "CUSTOMS_HOLD"
             else:
                 issue_type = ISSUE_TYPE_BY_DELAY_REASON.get(reason_for_delay, "OTHER")
             reported_at = created_at + timedelta(hours=random.randint(1, 24))
-            if current_status == "DELIVERED":
+            if scenario in ("CUSTOMS_HOLD_RESOLVED_VALID", "DELAY_RESOLVED_VALID"):
+                # These two scenarios ARE the "resolved with a specific valid
+                # reason" case by construction — always RESOLVED, never left
+                # to the 35% coin-flip below (which uses generic reason text).
+                issue_status = "RESOLVED"
+                resolved_at = delivery_date if current_status == "DELIVERED" else min(
+                    reported_at + timedelta(hours=random.randint(6, 72)), now
+                )
+            elif current_status == "DELIVERED":
                 issue_status = "RESOLVED"
                 resolved_at = delivery_date
             elif current_status in ("RETURNED_TO_SENDER",):
