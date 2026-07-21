@@ -73,7 +73,7 @@
         "intent": "open_issues_for_shipment",
         "entities": ["shipment_issue"],
         "recommended_query": "SELECT * FROM shipment_issues WHERE tracking_id = $1 AND status IN ('OPEN','INVESTIGATING') ORDER BY reported_at DESC;",
-        "example_nl": "Are there any open issues on this shipment?"
+        "example_nl": "What is the issue with tracking number 794658312457?"
       },
       {
         "intent": "ops_daily_briefing",

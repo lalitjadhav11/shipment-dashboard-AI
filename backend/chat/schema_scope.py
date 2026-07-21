@@ -24,7 +24,7 @@ from . import schema_loader
 DEFAULT_TOP_K = 4
 
 # Raw, per-record entities to force into scope for identity/list-style
-# questions — see _wants_individual_records(). Aggregate views group across
+# questions — see wants_individual_records(). Aggregate views group across
 # many rows and structurally cannot answer "give me 5 shipments" or "what's
 # happening with tracking_id X" even when they score topically similar;
 # no amount of embedding-similarity tuning fixes that category of miss,
@@ -34,6 +34,18 @@ RECORD_LEVEL_ENTITIES = ["shipment"]
 
 _LIST_PATTERN = re.compile(
     r"\b(?:list|give me|show me|which|show all)\b.{0,20}\b(?:shipments?|packages?|orders?)\b"
+    # Live regression (§18): "Give me a breakdown of shipment statuses" matched
+    # this pattern purely because "shipment" appears as a modifier before
+    # "statuses" — a genuine aggregate request, not a request for individual
+    # records — and once wants_individual_records() started actually gating
+    # aggregate templates (not just forcing scope), that false match started
+    # discarding correct answers. The negative lookahead blocks exactly the
+    # "shipment(s)" + aggregate-noun adjacency that signals a breakdown/
+    # summary/trend request, while still matching "shipments with status X"
+    # (a genuine filtered list — "with"/other words intervene, so the
+    # lookahead's \s*-only gap doesn't suppress it). Verified against both
+    # classes before committing — see AGENTIC_RAG_ARCHITECTURE.md §18.
+    r"(?!\s*(?:status(?:es)?|breakdown|summary|trend|performance|volume|split|mix|rate|percentage)\b)"
     r"|\b\d+\s+(?:shipments?|packages?|orders?)\b",
     re.IGNORECASE,
 )
@@ -114,11 +126,15 @@ class ScopedSchema:
     # signals below, not by ranking — kept separate so the trace can say *why*
 
 
-def _wants_individual_records(query: str, extracted) -> bool:
+def wants_individual_records(query: str, extracted) -> bool:
     """True when the query is about a SPECIFIC identified thing (a
     tracking_id, a named customer, a named city) or explicitly asks to
     list/enumerate records ('give me 5 shipments') — both mean an aggregate
-    view is the wrong shape regardless of how topically similar it scores."""
+    view is the wrong shape regardless of how topically similar it scores.
+    Public (not `_`-prefixed) — same reasoning as is_causal_query above:
+    pipeline.py's post-Stage-4a gate needs this exact same signal to decline
+    an aggregate-only template match, not just the entity-forcing use here.
+    See AGENTIC_RAG_ARCHITECTURE.md §18."""
     if extracted is not None and (extracted.tracking_id or extracted.org_name or extracted.location):
         return True
     return bool(_LIST_PATTERN.search(query))
@@ -139,7 +155,7 @@ def scope_schema(query: str, extracted=None, top_k: int = DEFAULT_TOP_K) -> Scop
     scores = {name: score for name, score in scored[:top_k]}
 
     forced = []
-    if _wants_individual_records(query, extracted):
+    if wants_individual_records(query, extracted):
         for entity in RECORD_LEVEL_ENTITIES:
             if entity not in ranked and entity in scored_lookup:
                 ranked.append(entity)

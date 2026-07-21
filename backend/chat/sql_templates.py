@@ -49,6 +49,11 @@ class TemplateSpec:
     # a distribution, not an explanation. pipeline.py checks this before accepting a Stage 4a
     # match for a causal-phrased query ("why is X happening") — see AGENTIC_RAG_ARCHITECTURE.md
     # §15. Deliberately narrow: only why_is_it_late qualifies today.
+    is_aggregate: bool = False  # True for the 10 zero-param fleet-wide dashboard/breakdown
+    # templates — grouped counts/percentages, structurally incapable of answering "show me all
+    # X shipments" no matter how confidently Stage 1 matches them. pipeline.py declines a match
+    # here when schema_scope.wants_individual_records() is True, the same pattern as
+    # explains_causation above — see AGENTIC_RAG_ARCHITECTURE.md §18.
 
 
 def _tracking_id_params(entities):
@@ -179,14 +184,26 @@ TEMPLATES = {
         required=("tracking_id",),
     ),
     "open_issues_for_shipment": TemplateSpec(
+        # Live query: "what's the issue with 800000000019" correctly routed
+        # here (§16.4's example_nl fix), but the old WHERE-clause-only filter
+        # answered "no open issues found" for a shipment that WAS returned to
+        # sender over an address issue — the issue existed, just CLOSED, so
+        # it was invisible to a strictly-OPEN-only query. Rather than a
+        # separate fallback query, one ORDER BY does both jobs: open/
+        # investigating issues sort first when they exist, resolved/closed
+        # ones are still returned (just last) when they don't — the
+        # formatter (respond_template.py) then reads which case it got from
+        # the rows themselves.
         intent="open_issues_for_shipment",
         entity_keys=("shipment_issue",),
         sql="""
             SELECT issue_id, issue_type, description, status, reported_at, resolved_at
             FROM shipment_issues
             WHERE tracking_id = %(tracking_id)s
-              AND status IN ('OPEN', 'INVESTIGATING')
-            ORDER BY reported_at DESC
+            ORDER BY
+              CASE WHEN status IN ('OPEN', 'INVESTIGATING') THEN 0 ELSE 1 END,
+              reported_at DESC
+            LIMIT 5
         """,
         required=("tracking_id",),
     ),
@@ -200,6 +217,7 @@ TEMPLATES = {
             ORDER BY issue_count DESC
         """,
         required=(),
+        is_aggregate=True,
     ),
     "top_customers_by_volume": TemplateSpec(
         intent="top_customers_by_volume",
@@ -209,6 +227,7 @@ TEMPLATES = {
             FROM v_top_customers
         """,
         required=(),
+        is_aggregate=True,
     ),
 
     # --- Zero-param views (8 new — every previously-unwired dashboard view) ---
@@ -222,6 +241,7 @@ TEMPLATES = {
             FROM v_dashboard_headline
         """,
         required=(),
+        is_aggregate=True,
     ),
     "status_breakdown": TemplateSpec(
         intent="status_breakdown",
@@ -232,6 +252,7 @@ TEMPLATES = {
             ORDER BY shipment_count DESC
         """,
         required=(),
+        is_aggregate=True,
     ),
     "ontime_performance": TemplateSpec(
         intent="ontime_performance",
@@ -242,6 +263,7 @@ TEMPLATES = {
             FROM v_ontime_performance
         """,
         required=(),
+        is_aggregate=True,
     ),
     "delay_reason_breakdown": TemplateSpec(
         intent="delay_reason_breakdown",
@@ -252,6 +274,7 @@ TEMPLATES = {
             ORDER BY shipment_count DESC
         """,
         required=(),
+        is_aggregate=True,
     ),
     "domestic_vs_international_split": TemplateSpec(
         intent="domestic_vs_international_split",
@@ -261,6 +284,7 @@ TEMPLATES = {
             FROM v_domestic_vs_international
         """,
         required=(),
+        is_aggregate=True,
     ),
     "daily_volume_trend": TemplateSpec(
         # NOT v_daily_volume_trend — that view's unbounded generate_series
@@ -296,6 +320,7 @@ TEMPLATES = {
             LIMIT 14
         """,
         required=(),
+        is_aggregate=True,
     ),
     "service_level_mix": TemplateSpec(
         intent="service_level_mix",
@@ -306,6 +331,7 @@ TEMPLATES = {
             ORDER BY shipment_count DESC
         """,
         required=(),
+        is_aggregate=True,
     ),
     "chat_activity_summary": TemplateSpec(
         intent="chat_activity_summary",
@@ -316,15 +342,24 @@ TEMPLATES = {
             FROM v_chat_activity_summary
         """,
         required=(),
+        is_aggregate=True,
     ),
 
     # --- Mix-and-match filtered/joined templates (6 new) -----------------
+    # Every "shipments_by_*" list template below includes COUNT(*) OVER() AS
+    # total_count — a window function computed alongside the LIMITed rows in
+    # the same query (no second round trip) — so the formatter can say
+    # "showing 20 of 958" instead of implying 20 is everything. Requested
+    # directly: answers were silently truncating a filter's true size (e.g.
+    # 600 CUSTOMS_HOLD shipments existed; the old answer just said "20
+    # shipment(s)" with no indication 580 more were left out).
     "shipments_by_customer": TemplateSpec(
         intent="shipments_by_customer",
         entity_keys=("shipment", "customer"),
         sql="""
             SELECT s.tracking_id, s.current_status, s.reason_for_delay,
-                   s.estimated_delivery, s.delivery_date
+                   s.estimated_delivery, s.delivery_date,
+                   COUNT(*) OVER() AS total_count
             FROM shipments s
             JOIN customers c ON c.customer_id = s.customer_id
             WHERE c.org_name = %(org_name)s
@@ -337,7 +372,8 @@ TEMPLATES = {
         intent="shipments_by_customer_delayed",
         entity_keys=("shipment", "customer"),
         sql="""
-            SELECT s.tracking_id, s.current_status, s.reason_for_delay, s.delay_comments
+            SELECT s.tracking_id, s.current_status, s.reason_for_delay, s.delay_comments,
+                   COUNT(*) OVER() AS total_count
             FROM shipments s
             JOIN customers c ON c.customer_id = s.customer_id
             WHERE c.org_name = %(org_name)s
@@ -351,7 +387,8 @@ TEMPLATES = {
         intent="shipments_by_status",
         entity_keys=("shipment",),
         sql="""
-            SELECT tracking_id, current_status, reason_for_delay, estimated_delivery
+            SELECT tracking_id, current_status, reason_for_delay, estimated_delivery,
+                   COUNT(*) OVER() AS total_count
             FROM shipments
             WHERE current_status = %(current_status)s
             ORDER BY updated_at DESC
@@ -363,7 +400,8 @@ TEMPLATES = {
         intent="shipments_by_package_type",
         entity_keys=("shipment",),
         sql="""
-            SELECT tracking_id, current_status, package_type, package_size
+            SELECT tracking_id, current_status, package_type, package_size,
+                   COUNT(*) OVER() AS total_count
             FROM shipments
             WHERE package_type = %(package_type)s
             ORDER BY created_at DESC
@@ -375,7 +413,8 @@ TEMPLATES = {
         intent="shipments_by_delivery_type",
         entity_keys=("shipment",),
         sql="""
-            SELECT tracking_id, current_status, delivery_type, estimated_delivery
+            SELECT tracking_id, current_status, delivery_type, estimated_delivery,
+                   COUNT(*) OVER() AS total_count
             FROM shipments
             WHERE delivery_type = %(delivery_type)s
             ORDER BY created_at DESC
@@ -387,7 +426,8 @@ TEMPLATES = {
         intent="failed_delivery_shipments",
         entity_keys=("shipment",),
         sql="""
-            SELECT tracking_id, current_status, failed_delivery_attempts, last_delivery_attempt_at
+            SELECT tracking_id, current_status, failed_delivery_attempts, last_delivery_attempt_at,
+                   COUNT(*) OVER() AS total_count
             FROM shipments
             WHERE failed_delivery_attempts > 0
             ORDER BY failed_delivery_attempts DESC
@@ -403,7 +443,8 @@ TEMPLATES = {
         intent="shipments_by_location",
         entity_keys=("shipment",),
         sql="""
-            SELECT tracking_id, current_status, src_loc, dest_loc
+            SELECT tracking_id, current_status, src_loc, dest_loc,
+                   COUNT(*) OVER() AS total_count
             FROM shipments
             WHERE src_loc ->> 'city' = %(location)s OR dest_loc ->> 'city' = %(location)s
             ORDER BY created_at DESC
@@ -415,7 +456,8 @@ TEMPLATES = {
         intent="shipments_by_package_size",
         entity_keys=("shipment",),
         sql="""
-            SELECT tracking_id, current_status, package_type, package_size
+            SELECT tracking_id, current_status, package_type, package_size,
+                   COUNT(*) OVER() AS total_count
             FROM shipments
             WHERE package_size = %(package_size)s
             ORDER BY created_at DESC
@@ -427,7 +469,8 @@ TEMPLATES = {
         intent="shipments_by_pickup_date",
         entity_keys=("shipment",),
         sql="""
-            SELECT tracking_id, current_status, pickup_date, pickup_window_start, pickup_window_end
+            SELECT tracking_id, current_status, pickup_date, pickup_window_start, pickup_window_end,
+                   COUNT(*) OVER() AS total_count
             FROM shipments
             WHERE pickup_date = %(pickup_date)s
             ORDER BY pickup_window_start

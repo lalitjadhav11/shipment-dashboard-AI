@@ -108,7 +108,14 @@ def synthesize(query: str, rows: list, sql: str | None = None, params: dict | No
         tool_name=TOOL_NAME,
         tool_schema=TOOL_SCHEMA,
     )
-    if result is None:
+    # Live case: the tool call itself succeeded (result is a real dict, not None)
+    # but the model left "answer" blank — reproduced directly against the same
+    # prompt/rows and got a full, correct answer on the very next attempt, so
+    # this is LLM output non-determinism, not a deterministic prompt bug. Empty
+    # "answer" must degrade the same way `result is None` already does — a
+    # blank string is a broken response, not a legitimate empty answer, even
+    # though the call "succeeded" by the only check that used to run.
+    if result is None or not result.get("answer"):
         return ShipmentAnswer(
             answer="I found some data but wasn't able to generate a clear answer from it.",
             confidence_score=0.0,

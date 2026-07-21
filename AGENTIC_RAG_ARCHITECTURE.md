@@ -1306,3 +1306,145 @@ genuinely needs synthesis and routing exactly that shape to Stage 4b — not aba
 tiered design. The pattern across all four rounds: every "this looks like the LLM should have
 handled it" report so far has turned out to be a **routing** gap (the wrong, non-explanatory
 template winning), not evidence that routing itself is the wrong strategy.
+
+## 16.4 "What's the issue with X" — a plain intent-matching gap, and a data-completeness gap under it
+
+Live query: *"whats the issue with 800000000019"* — matched `shipment_customer_lookup` at 0.419
+confidence (barely above threshold) and returned the customer's name/account, not remotely what
+was asked. Unlike §16-§16.3, this wasn't a missing-template or wrong-question-shape problem —
+`open_issues_for_shipment` already exists and already explains real issue content (`issue_type`
++ `description`, not just a count). It simply never scored competitively: its example
+(`"Are there any open issues on this shipment?"`) shares little vocabulary with "what's *the
+issue* with X" (formal/plural "open issues" vs. casual/singular "the issue"), scoring only 0.215
+for this query — nowhere close to the 0.419 that won.
+
+**Fix:** reworded the example to `"What is the issue with tracking number 794658312457?"` —
+mirroring the actual failing phrasing, same methodology as every prior reword this session.
+Verified the swap didn't destabilize the three intents it sits closest to before committing:
+`why_is_it_late` still wins its own query at 0.885 vs. the new example's 0.422; `where_is_my_package`
+still wins at 0.911 vs. 0.733; `shipment_customer_lookup` still wins at 0.695 vs. 0.386; and the
+already-passing regression case (`"Are there any open issues on 700000000001?"`) still resolves
+correctly — its own score drops from 0.574 to 0.373 under the new wording, but the runner-up
+(`shipment_delivery_attempts`) only scores 0.322, leaving a safe margin.
+
+**Second-order finding, only visible once routing was fixed:** the corrected answer for
+`800000000019` was *"No open issues found for this shipment"* — technically true (its one
+`shipment_issues` row has `status = CLOSED`) but misleading for how generically the question was
+phrased: this shipment really was `RETURNED_TO_SENDER` over an `ADDRESS_ISSUE`, and a user asking
+"what's the issue" almost certainly wants that, not confirmation that nothing is *currently*
+open. Fixed by changing the template's `WHERE status IN ('OPEN','INVESTIGATING')` filter to an
+`ORDER BY CASE WHEN status IN (...) THEN 0 ELSE 1 END, reported_at DESC LIMIT 5` instead — open/
+investigating issues still surface first when they exist, but resolved/closed ones are no longer
+filtered out entirely, just deprioritized. The formatter (`respond_template.py`) now distinguishes
+three cases from the same query shape: a genuine open issue (unchanged "Found N open issue(s)"
+framing), no issues at all (unchanged "No issues found"), and — the new case — no open issues but
+a resolved/closed one on record ("No currently open issues, but this shipment has resolved/closed
+issue(s) on record: ..."). Verified all three live against real tracking IDs for each case.
+
+Same recurring lesson as §14/§15.1: correctness at the routing layer doesn't guarantee
+completeness at the data layer underneath it — fixing "which template wins" surfaced a second,
+independent gap in what that template's own query was willing to show.
+
+## 17. Every list template silently implied its LIMIT was the whole answer
+
+Requested directly, not from a single failing query: every "shipments_by_*"-style list template
+(`shipments_by_customer`, `shipments_by_customer_delayed`, `shipments_by_status`,
+`shipments_by_package_type`, `shipments_by_delivery_type`, `failed_delivery_shipments`,
+`shipments_by_location`, `shipments_by_package_size`, `shipments_by_pickup_date`) caps its result
+at `LIMIT 20`, but the answer only ever said e.g. *"20 shipment(s) with status CUSTOMS_HOLD"* —
+with 600 actually matching, the other 580 were silently missing with no indication anything was
+cut off.
+
+**Fix:** added `COUNT(*) OVER() AS total_count` to each of the 9 templates' SELECT list — a
+window function computed alongside the LIMITed rows in the exact same query (no second round
+trip, no separate `COUNT(*)` query). Confirmed the guardrail's `_select_aliases()` (already
+built to recognize computed aliases like `count(*) AS shipment_count` — see §9's original
+aggregation-query fix) accepts this without any guardrail change needed. Added a shared
+`_count_fragment()` helper in `respond_template.py`: `"20 of 600"` when `total_count` exceeds the
+row count actually returned, or just `"20"` when the shown rows already are everything (no
+redundant "20 of 20"). Threaded into all 9 formatters' existing header sentences.
+
+Verified live: `CUSTOMS_HOLD` now reads *"20 of 600 shipment(s) with status CUSTOMS_HOLD"*;
+`PALLET` shipments *"20 of 4134"*; a customer with only 19 total shipments correctly shows just
+the bare count with no "of 19." One phrasing casualty caught by testing the truncated case
+specifically (not just the common one): `shipments_by_customer_delayed`'s original sentence
+structure (`"{count} of {customer}'s shipments..."`) doubled up on "of" once `_count_fragment`
+itself could also return an "of"-phrase (`"20 of 26 of Baker LLC's shipments are currently
+delayed"`) — restructured to `"Of {customer}'s shipments, {count} are currently delayed"`, which
+reads correctly in both the exact-count and truncated cases. Directly unit-verified
+`_count_fragment()`'s two branches plus the empty-rows case, then live-verified across all 9
+templates (customer, customer-delayed, status, package type, delivery type, failed-delivery,
+location, package size, pickup date) with both truncated and non-truncated real data — no
+regressions.
+
+`open_issues_for_shipment` deliberately excluded from this round — its `LIMIT 5` is already
+running the §16.4 open/closed prioritization logic, and a single shipment realistically never
+has enough issues for the same "580 hidden" problem this fixes at fleet scale; revisit only if
+that assumption turns out wrong in practice.
+
+## 18. A confidently-matched AGGREGATE template is the same class of bug as §15's causal one
+
+Live query: *"show me all custom shipments those are impacted due to weather delay"* — entity
+extraction worked perfectly (`package_type=CUSTOM`, `reason_for_delay=WEATHER` both correctly
+fuzzy-matched), and Stage 3 correctly forced `shipment` into scope (`wants_individual_records()`
+correctly recognized this as a list-of-records question). But Stage 1 still confidently matched
+`delay_reason_breakdown` (0.664) — a zero-param aggregate that "fills" trivially regardless of
+what filters the user gave — and returned the full 7-row breakdown table, never once looking at
+either of the two filters the user actually specified. No template combines `package_type` AND
+`reason_for_delay` together (the mix-and-match templates from §10 only ever filter on ONE
+attribute at a time), so the honest answer here could only ever come from Stage 4b — but nothing
+was stopping the aggregate template from winning first and "succeeding" before Stage 4b got a
+chance.
+
+This is structurally identical to §15's original bug (a successfully-filled template is not
+necessarily the *right* one), just for a different signal: "wants individual records" instead of
+"wants a cause." `schema_scope.wants_individual_records()` (promoted from `_wants_individual_records`,
+same reasoning as `is_causal_query`'s promotion in §15.1 — pipeline.py's gate needs the identical
+signal, not a second copy of it) already existed and was already correctly firing — it just had
+no consumer that actually *declined* a match on its account, only one that *added* scope for
+Stage 4b if Stage 4b were ever reached.
+
+**Fix, mirroring §15's `explains_causation` mechanism exactly:** added `TemplateSpec.is_aggregate`
+(`True` for all 10 zero-param fleet-wide dashboard templates — `dashboard_headline`,
+`status_breakdown`, `ontime_performance`, `delay_reason_breakdown`, `domestic_vs_international_split`,
+`daily_volume_trend`, `service_level_mix`, `chat_activity_summary`, `ops_daily_briefing`,
+`top_customers_by_volume`), and a second `elif` in `pipeline.py`'s post-Stage-4a gate, right
+alongside the causal one: if `wants_individual_records(query, extracted)` is True and the resolved
+template `is_aggregate`, discard the fill and route to Stage 4b — new `list_query_needs_llm` trace
+event, same waterfall entry point.
+
+Verified: Stage 4b correctly drafted `WHERE package_type = %(package_type)s AND reason_for_delay
+= %(reason_for_delay)s` (138 real matching rows) — proving the compound-filter capability was
+always there in Stage 4b, just unreachable because Stage 4a never stepped aside.
+
+**Regression caught during verification, not after:** re-running the standing aggregate-query
+regression set turned up a real false positive the new gate made consequential for the first
+time — *"Give me a breakdown of shipment statuses"* (a genuine aggregate request) also matched
+`_LIST_PATTERN`, because "shipment" appears as a bare word immediately before "statuses." This
+regex imprecision existed before this section (harmless then — it only ever added scope, never
+discarded a match) but became a real bug the moment `wants_individual_records()` gained a
+consumer that could reject a template outright. Fixed with a negative lookahead blocking
+"shipment(s)" immediately followed by an aggregate-noun (`status(es)`, `breakdown`, `summary`,
+`trend`, `performance`, `volume`, `split`, `mix`, `rate`, `percentage`) — verified this still
+matches genuine filtered-list phrasing like *"shipments with status delivered"* (an intervening
+word means the lookahead's whitespace-only gap doesn't suppress it) while correctly excluding
+*"shipment statuses"*, *"shipment status breakdown"*, *"shipment performance trend"*, and
+*"shipment volume"* summaries. Re-ran the full regression set (4 aggregate queries, 4 list
+queries, 2 tracking-id queries) clean after the fix.
+
+**Second-order bug, found while verifying the fix, not caused by it:** the corrected Stage 4b/7v1
+path occasionally returned `answer: ""` — the SQL executed correctly (138 rows) and the tool call
+itself succeeded, but the model left the `answer` field blank. Reproduced the *exact* same
+prompt/rows twice directly against `synthesize.synthesize()` and got a complete, correct answer
+both times (confidence 0.95, 1.0) — confirming this is LLM output non-determinism, not a
+deterministic prompt defect. `synthesize.py` previously only guarded against the tool call
+failing outright (`result is None`); a successful call with a blank `answer` field slipped through
+as a broken empty response. Fixed by treating `not result.get("answer")` the same as `result is
+None` — same graceful-decline fallback either way, consistent with the file's own standing rule
+("an LLM failure must never surface as nothing/broken, only as an honest decline").
+
+Three finds from one bug report, same underlying theme as this whole architecture doc: fixing the
+reported issue exposed a pre-existing false-positive one layer up (the regex), and verifying the
+fix exposed a genuinely independent reliability gap one layer down (the empty-answer guard) —
+neither would have surfaced without actually running the fix against live data and a real
+regression set, not just reasoning about the change in isolation.

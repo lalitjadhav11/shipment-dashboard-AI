@@ -212,13 +212,23 @@ def _customs_status(rows: list) -> ShipmentAnswer:
 
 
 def _open_issues_for_shipment(rows: list, tracking_id: str | None) -> ShipmentAnswer:
+    # The query (sql_templates.py) sorts OPEN/INVESTIGATING first but doesn't
+    # filter them out — a shipment with no CURRENTLY open issue can still
+    # have a resolved/closed one worth surfacing ("what's the issue with X"
+    # asked generically, not "is anything open right now"), so distinguish
+    # the two cases here rather than treating every row as "open."
+    open_rows = [r for r in rows if r["status"] in ("OPEN", "INVESTIGATING")]
     if not rows:
-        answer = "No open issues found for this shipment."
+        answer = "No issues — open or resolved — found for this shipment."
         confidence = 0.9
+    elif open_rows:
+        lines = [f"- {r['issue_type']}: {r.get('description') or 'no description'} ({r['status']})" for r in open_rows]
+        answer = f"Found {len(open_rows)} open issue(s):\n" + "\n".join(lines)
+        confidence = 1.0
     else:
         lines = [f"- {r['issue_type']}: {r.get('description') or 'no description'} ({r['status']})" for r in rows]
-        answer = f"Found {len(rows)} open issue(s):\n" + "\n".join(lines)
-        confidence = 1.0
+        answer = "No currently open issues, but this shipment has resolved/closed issue(s) on record:\n" + "\n".join(lines)
+        confidence = 0.9
     return ShipmentAnswer(
         answer=answer,
         tracking_id=tracking_id,
@@ -337,6 +347,22 @@ def _chat_activity_summary(rows: list) -> ShipmentAnswer:
 
 # --- Mix-and-match filtered/joined templates (6 new) ------------------------
 
+def _count_fragment(rows: list) -> str:
+    """'20 of 958' when total_count (COUNT(*) OVER(), added to every list
+    template's SELECT — see sql_templates.py) shows the query's LIMIT
+    truncated a larger match set; just '20' when the shown rows already are
+    everything. Requested directly: answers were silently implying the shown
+    count was the complete count, even when hundreds more existed beyond the
+    LIMIT (e.g. 600 CUSTOMS_HOLD shipments existed; the old answer just said
+    "20 shipment(s)" with no hint 580 more were left out)."""
+    if not rows:
+        return "0"
+    total = rows[0].get("total_count", len(rows))
+    if total and total > len(rows):
+        return f"{len(rows)} of {total}"
+    return str(len(rows))
+
+
 def _shipments_by_customer(rows: list, org_name: str | None) -> ShipmentAnswer:
     who = org_name or "that customer"
     if not rows:
@@ -346,7 +372,7 @@ def _shipments_by_customer(rows: list, org_name: str | None) -> ShipmentAnswer:
         + (f" (delayed: {r['reason_for_delay']})" if r.get("reason_for_delay") not in (None, "NONE") else "")
         for r in rows
     ]
-    return ShipmentAnswer(answer=f"{who} has {len(rows)} shipment(s):\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{who} has {_count_fragment(rows)} shipment(s):\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -360,7 +386,7 @@ def _shipments_by_customer_delayed(rows: list, org_name: str | None) -> Shipment
         + (f" — {r['delay_comments']}" if r.get("delay_comments") else "")
         for r in rows
     ]
-    return ShipmentAnswer(answer=f"{len(rows)} of {who}'s shipments are currently delayed:\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"Of {who}'s shipments, {_count_fragment(rows)} are currently delayed:\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -374,7 +400,7 @@ def _shipments_by_status(rows: list, status: str | None) -> ShipmentAnswer:
         + (f" (delayed: {r['reason_for_delay']})" if r.get("reason_for_delay") not in (None, "NONE") else "")
         for r in rows
     ]
-    return ShipmentAnswer(answer=f"{len(rows)} shipment(s) with status {label}:\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{_count_fragment(rows)} shipment(s) with status {label}:\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -383,7 +409,7 @@ def _shipments_by_package_type(rows: list, package_type: str | None) -> Shipment
     if not rows:
         return ShipmentAnswer(answer=f"No {label} shipments found.", confidence_score=0.9, supporting_data=[])
     lines = [f"- {r['tracking_id']}: {r['current_status']} ({r.get('package_size', 'unknown size')})" for r in rows]
-    return ShipmentAnswer(answer=f"{len(rows)} {label} shipment(s):\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{_count_fragment(rows)} {label} shipment(s):\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -392,7 +418,7 @@ def _shipments_by_delivery_type(rows: list, delivery_type: str | None) -> Shipme
     if not rows:
         return ShipmentAnswer(answer=f"No {label} shipments found.", confidence_score=0.9, supporting_data=[])
     lines = [f"- {r['tracking_id']}: {r['current_status']}, ETA {r.get('estimated_delivery') or 'unknown'}" for r in rows]
-    return ShipmentAnswer(answer=f"{len(rows)} {label} shipment(s):\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{_count_fragment(rows)} {label} shipment(s):\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -405,7 +431,7 @@ def _failed_delivery_shipments(rows: list) -> ShipmentAnswer:
         f"last at {r.get('last_delivery_attempt_at') or 'unknown'}"
         for r in rows
     ]
-    return ShipmentAnswer(answer=f"{len(rows)} shipment(s) with failed delivery attempts:\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{_count_fragment(rows)} shipment(s) with failed delivery attempts:\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -419,7 +445,7 @@ def _shipments_by_location(rows: list, location: str | None) -> ShipmentAnswer:
         src = (r.get("src_loc") or {}).get("city", "?")
         dest = (r.get("dest_loc") or {}).get("city", "?")
         lines.append(f"- {r['tracking_id']}: {r['current_status']} ({src} -> {dest})")
-    return ShipmentAnswer(answer=f"{len(rows)} shipment(s) touching {where}:\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{_count_fragment(rows)} shipment(s) touching {where}:\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -428,7 +454,7 @@ def _shipments_by_package_size(rows: list, package_size: str | None) -> Shipment
     if not rows:
         return ShipmentAnswer(answer=f"No {label} shipments found.", confidence_score=0.9, supporting_data=[])
     lines = [f"- {r['tracking_id']}: {r['current_status']} ({r.get('package_type', 'unknown type')})" for r in rows]
-    return ShipmentAnswer(answer=f"{len(rows)} {label} shipment(s):\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{_count_fragment(rows)} {label} shipment(s):\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 
@@ -442,7 +468,7 @@ def _shipments_by_pickup_date(rows: list, pickup_date: str | None) -> ShipmentAn
         + (f" ({r['pickup_window_start']}-{r['pickup_window_end']})" if r.get("pickup_window_start") else "")
         for r in rows
     ]
-    return ShipmentAnswer(answer=f"{len(rows)} shipment(s) scheduled for pickup on {when}:\n" + "\n".join(lines),
+    return ShipmentAnswer(answer=f"{_count_fragment(rows)} shipment(s) scheduled for pickup on {when}:\n" + "\n".join(lines),
                            confidence_score=1.0, supporting_data=rows)
 
 

@@ -243,6 +243,23 @@ def run_pipeline(query: str):
                 "intent": resolved_intent,
             }}
             filled = None
+        elif schema_scope.wants_individual_records(query, extracted) and sql_templates.TEMPLATES[resolved_intent].is_aggregate:
+            # Live query: "show me all custom shipments those are impacted due to weather
+            # delay" — entity extraction correctly found package_type=CUSTOM AND
+            # reason_for_delay=WEATHER, and Stage 3 correctly forced `shipment` into scope
+            # (this IS a list-of-records question) — but Stage 1 still confidently matched
+            # delay_reason_breakdown, a zero-param aggregate that "fills" trivially and
+            # never even looks at the two filters the user actually gave. Same shape as
+            # the causal gate above, different signal: a successfully-filled AGGREGATE
+            # template is not the right answer to a "show me all X" question, regardless
+            # of how confidently it matched. See AGENTIC_RAG_ARCHITECTURE.md §18.
+            yield {"stage": "list_query_needs_llm", "detail": {
+                "reason": "the query asks for individual shipment records, but the matched "
+                          "template only returns a fleet-wide aggregate/breakdown — routing "
+                          "to Stage 4b instead of returning an irrelevant summary",
+                "intent": resolved_intent,
+            }}
+            filled = None
 
     if filled is None:
         # Stage 4a is exhausted — either nothing matched, or something matched
