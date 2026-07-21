@@ -1540,3 +1540,32 @@ topically-generic tables, for as long as that table's own vocabulary doesn't hap
 users phrase the question — the fix is never "wait for a better embedding model," it's "name the
 signal, force the entity, and tell the LLM why it matters," every time a new question shape
 surfaces this same gap.
+
+## 21. A missing space silently defeated tracking_id extraction entirely
+
+Live query: *"800000000019give the summary of status"* (no space before "give") — answered with
+the fleet-wide status breakdown instead of anything about that specific shipment. Root cause was
+in Stage 2, not routing: `TRACKING_ID_RE = re.compile(r"\b\d{9,15}\b")` requires a word boundary
+(`\b`) immediately after the digit run, but a digit immediately followed by a letter is **not** a
+word boundary in regex terms — both `\d` and `[a-zA-Z]` are `\w` characters, so there's no
+boundary between the `9` in `...019` and the `g` in `give`. `extract_entities()` silently found
+zero tracking IDs, and everything downstream behaved *correctly* given that (empty) input —
+`where_is_my_package` failed to fill (no tracking_id), fell to Stage 4b, which correctly
+answered a fleet-wide "summary of status" question — the routing wasn't the bug, the entity
+extraction feeding it was.
+
+**Fix:** replaced the word-boundary requirement with `(?<!\d)\d{9,15}(?!\d)` — "not immediately
+adjacent to another digit" on both sides, instead of "adjacent to a non-word character." A
+tracking ID is a maximal run of 9-15 digits regardless of what surrounds it — letters,
+punctuation, string boundaries, or (the bug) nothing at all. Verified safe against every other
+numeric field in the schema before committing (order IDs like `ORD-2026-2000004`, phone numbers,
+postal codes, dates, account IDs) — none contain a 9+ consecutive-digit run, so none can
+accidentally start matching as a false-positive tracking ID. Verified both directions (digits
+glued to a following word, and — checked defensively, not yet seen live — digits glued to a
+*preceding* word) plus the existing standing regression set (multi-ID queries, bare tracking IDs,
+non-tracking-id queries like org_name/enum lookups) — all still correct.
+
+Different failure layer than every other section in this document so far (§15-§20 were all
+Stage 1/3/4b routing or scoping gaps) — a reminder that "the answer is wrong" doesn't always mean
+the routing layer is where to look first; here the fix was two stages earlier, in the regex that
+was supposed to hand routing a tracking_id in the first place.

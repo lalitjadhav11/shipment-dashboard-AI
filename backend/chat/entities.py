@@ -15,7 +15,18 @@ from rapidfuzz import process, fuzz, utils as fuzz_utils
 from . import schema_loader
 from .db import get_agent_cursor
 
-TRACKING_ID_RE = re.compile(r"\b\d{9,15}\b")
+# Live query: "800000000019give the summary of status" (no space before
+# "give") extracted NOTHING — \b (word boundary) never fires between a digit
+# and a following letter, since both are \w characters; there's no boundary
+# there for regex purposes even though it reads as an obvious tracking ID
+# glued to the next word. (?<!\d)...(?!\d) replaces the word-boundary
+# requirement with "not immediately adjacent to another digit" on both
+# sides — a tracking ID is a maximal run of 9-15 digits regardless of
+# whether it's surrounded by letters, punctuation, or nothing. Verified
+# safe against every other numeric field in the schema (order IDs, phone
+# numbers, postal codes, dates, account IDs) — none have a 9+ consecutive-
+# digit run, so none can accidentally match. See AGENTIC_RAG_ARCHITECTURE.md §21.
+TRACKING_ID_RE = re.compile(r"(?<!\d)\d{9,15}(?!\d)")
 FUZZY_MATCH_THRESHOLD = 80  # rapidfuzz 0-100 scale
 
 # Enum fields worth fuzzy-matching against free text. Keyed by the field name
