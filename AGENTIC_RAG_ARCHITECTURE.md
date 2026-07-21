@@ -1492,3 +1492,51 @@ not the same as the routing being correct — it just means the failure didn't s
 Several sections in this document (§15's causal gate, §18's aggregate gate, and now this one) are
 all instances of the same lesson: don't stop investigating a "the answer looks right" report just
 because the answer looks right — check *how* it got there.
+
+## 20. "History of status" — the LLM confidently denied data that existed, because it never saw it
+
+Live query: *"give me details about 400000000014 and their history of status."* No template
+covers "details" + "history" together, so this correctly reached Stage 4b. But the LLM drafted
+`SELECT ... FROM shipments JOIN customers WHERE tracking_id = ...` — never touching
+`tracking_events` or `v_shipment_journey_summary` at all — and then the synthesized answer
+**explicitly claimed** *"the available data contains only the current snapshot; a complete
+historical status timeline is not present in the shipment record."* That claim is false — this
+exact shipment has 9 logged journey stages, verified directly against the database (and this
+document has a whole worked example using this same tracking ID two sections earlier).
+
+Root cause, same shape as §15.1's `shipment_issue` gap: neither `v_shipment_journey_summary`
+(which already has `journey_timeline` pre-aggregated as a JSONB array — literally the answer to
+"history of status") nor `tracking_event` scored into Stage 3's top-k for this query. Their own
+field/table names are about journey *logging*, not about the words "details" or "history," so
+Stage 4b's LLM never even knew either one existed — and, worse than §15.1's case, didn't just
+give an incomplete answer, it actively **asserted the data didn't exist**, which is a more
+damaging failure mode than silence.
+
+**Fix, identical pattern to §15.1/§16 twice over:**
+1. `schema_scope.wants_history()` — a new detector (`history`, `timeline`, `journey`,
+   `progression`, `past status(es)`, `previous stage(s)`, `status history`, `tracking events`) —
+   and `HISTORY_ENTITIES = ["v_shipment_journey_summary", "tracking_event"]`, force-scoped the
+   same way `CAUSAL_ENTITIES`/`RECORD_LEVEL_ENTITIES` already are.
+2. Learned from §15.1 the first time already: force-scoping alone doesn't guarantee the LLM
+   reaches for it. Added `sql_llm._history_guidance()` — the same pattern as
+   `_causal_guidance()` — explicitly instructing the LLM to prefer `journey_timeline` over
+   `shipments` alone when history entities are in scope, and explicitly forbidding it from
+   claiming historical data isn't available without first checking whether one of these two
+   sources was actually queried.
+
+Verified end to end: the LLM now drafts `SELECT ... journey_timeline FROM
+v_shipment_journey_summary WHERE tracking_id = ...`, and the synthesized answer includes a
+correct, complete 9-stage "Status History (Timeline)" section with real timestamps and
+locations, `confidence_score: 0.95` — instead of falsely denying the data existed.
+Regression-checked the three paths this touches adjacently (`where_is_my_package`,
+`why_is_it_late`, the §16.4 `failed_delivery_shipments` causal case) — all still resolve to their
+existing templates/behavior unaffected, since none of them reach Stage 4b's schema scoping in
+the first place.
+
+Third instance of the exact same architectural lesson in this document (§15.1 for causal
+questions, §16.3 for "what does X include," now history questions): a question type whose
+answer lives in a specific table will keep losing the embedding-similarity ranking to more
+topically-generic tables, for as long as that table's own vocabulary doesn't happen to match how
+users phrase the question — the fix is never "wait for a better embedding model," it's "name the
+signal, force the entity, and tell the LLM why it matters," every time a new question shape
+surfaces this same gap.

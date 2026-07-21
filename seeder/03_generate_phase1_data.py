@@ -382,6 +382,28 @@ def location_for_stage(stage: str, origin, dest, is_international: bool,
     return "Unknown"
 
 
+def note_for_stage(stage: str, reason_for_delay: str, delay_comments: str | None) -> str:
+    """CUSTOMS_HOLD/CUSTOMS_CLEARED are standard sub-stages build_journey()
+    splices into EVERY international shipment's journey — the customs
+    checkpoint every international package passes through, not by itself a
+    sign anything went wrong. Verified live: a shipment sitting at
+    CUSTOMS_CLEARED with reason_for_delay='NONE' and zero shipment_issues
+    rows has an IDENTICAL-looking CUSTOMS_HOLD->CUSTOMS_CLEARED journey to a
+    shipment that had a genuine, resolved customs incident — the two are
+    indistinguishable from tracking_events alone; telling them apart
+    required cross-referencing shipment_issues, which a plain journey view
+    doesn't do. Distinguishing note text closes that gap directly in the
+    journey itself: an actual incident (reason_for_delay == 'CUSTOMS') gets
+    the real delay_comments text; the routine checkpoint gets an explicit
+    'no issues' note instead of the generic placeholder every other stage
+    still uses."""
+    if stage in ("CUSTOMS_HOLD", "CUSTOMS_CLEARED"):
+        if reason_for_delay == "CUSTOMS" and delay_comments:
+            return delay_comments
+        return "Routine customs clearance checkpoint — no issues reported."
+    return "Auto-generated seed event"
+
+
 # =============================================================================
 # CORE GENERATION
 # =============================================================================
@@ -593,7 +615,7 @@ def generate_dataset(args, fake) -> dict:
                 str(uuid.uuid4()), tracking_id, stage,
                 location_for_stage(stage, origin, dest, is_international, origin_hub, dest_hub, connecting_hub),
                 ts,
-                "Auto-generated seed event",
+                note_for_stage(stage, reason_for_delay, delay_comments),
             ))
 
         # ---- shipment_issues ----
@@ -602,6 +624,7 @@ def generate_dataset(args, fake) -> dict:
                 issue_type = "FAILED_DELIVERY_ATTEMPT"
             else:
                 issue_type = ISSUE_TYPE_BY_DELAY_REASON.get(reason_for_delay, "OTHER")
+            reported_at = created_at + timedelta(hours=random.randint(1, 24))
             if current_status == "DELIVERED":
                 issue_status = "RESOLVED"
                 resolved_at = delivery_date
@@ -614,12 +637,34 @@ def generate_dataset(args, fake) -> dict:
             elif current_status == "DELIVERY_FAILED":
                 issue_status = "INVESTIGATING"
                 resolved_at = None
+            elif current_status != "CUSTOMS_HOLD" and random.random() < 0.35:
+                # Mid-journey (not yet DELIVERED/RETURNED/LOST/FAILED) —
+                # previously this branch was ALWAYS OPEN/INVESTIGATING, so
+                # "the issue got fixed, but the shipment hasn't reached
+                # DELIVERED yet" had NO representation in the data — every
+                # RESOLVED row was tied to DELIVERED by construction (see
+                # the branch above). This is exactly that missing case: a
+                # genuine incident that got resolved WHILE the shipment kept
+                # moving toward its next stage, not blocked anymore, just
+                # not delivered yet either. ~35% of eligible mid-journey
+                # delayed shipments get this treatment; the rest stay an
+                # active, ongoing problem (the unchanged branch below).
+                # current_status == "CUSTOMS_HOLD" excluded deliberately:
+                # that scenario means the shipment IS ACTIVELY sitting at
+                # the blocking stage RIGHT NOW (reason_for_delay="CUSTOMS"
+                # by construction) — marking that "RESOLVED" while its
+                # current_status still says "blocked" is a direct
+                # contradiction, caught live in the first regenerated
+                # dataset before being shipped (400000000088 had exactly
+                # this).
+                issue_status = "RESOLVED"
+                resolved_at = min(reported_at + timedelta(hours=random.randint(6, 72)), now)
             else:
                 issue_status = random.choice(["OPEN", "INVESTIGATING"])
                 resolved_at = None
             shipment_issues.append((
                 str(uuid.uuid4()), tracking_id, issue_type, delay_comments or "Delay reported.",
-                issue_status, created_at + timedelta(hours=random.randint(1, 24)), resolved_at,
+                issue_status, reported_at, resolved_at,
             ))
 
         # ---- shipment_chat_log (simulate ~8% of shipments generating chat activity) ----

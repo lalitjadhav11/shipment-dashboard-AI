@@ -108,10 +108,35 @@ def _causal_guidance(scoped_entities: list, query: str) -> str:
     )
 
 
+def _history_guidance(scoped_entities: list, query: str) -> str:
+    """Same lesson as _causal_guidance above, same section it's documented
+    in (AGENTIC_RAG_ARCHITECTURE.md §20): schema_scope.py force-includes
+    v_shipment_journey_summary/tracking_event for "history"/"timeline"
+    questions, but forcing an entity into the schema slice doesn't mean the
+    LLM will actually reach for it — live query "give me details about
+    400000000014 and their history of status" had the entity forced in but
+    still drafted shipments+customers only, then falsely claimed no
+    historical timeline existed in the data at all."""
+    if not schema_scope.wants_history(query):
+        return ""
+    if "v_shipment_journey_summary" not in scoped_entities and "tracking_event" not in scoped_entities:
+        return ""
+    return (
+        "\nThis question asks about STATUS HISTORY/TIMELINE, and journey data is available "
+        "above — PREFER v_shipment_journey_summary's journey_timeline column (a JSONB array "
+        "of every stage transition with timestamps) over querying shipments alone, which only "
+        "has the CURRENT status. If tracking_events is what's in scope instead, select its "
+        "full stage/location/event_timestamp/notes history ordered by event_timestamp. Never "
+        "claim historical data isn't available without first checking whether one of these two "
+        "sources was actually queried.\n"
+    )
+
+
 def _build_system_prompt(scoped_entities: list, query: str, available_params: dict) -> str:
     schema_text = schema_loader.describe_entities(scoped_entities)
     examples_text = _few_shot_examples(query)
     causal_text = _causal_guidance(scoped_entities, query)
+    history_text = _history_guidance(scoped_entities, query)
     params_text = (
         ", ".join(f"%({k})s = {v!r}" for k, v in available_params.items())
         if available_params else "(none extracted from this query)"
@@ -122,7 +147,7 @@ CURRENT DATE/TIME: {datetime.now(timezone.utc).isoformat()}
 
 SCHEMA (the only tables/columns that exist — do not reference anything else):
 {schema_text}
-{causal_text}
+{causal_text}{history_text}
 AVAILABLE PARAMETERS (reference these by %(name)s in your SQL — never write their values as literals):
 {params_text}
 NOTE on %(date)s specifically, if listed above: it is already the FULLY-RESOLVED absolute

@@ -63,6 +63,37 @@ _LIST_PATTERN = re.compile(
 # domain knowledge instead. See AGENTIC_RAG_ARCHITECTURE.md §15.1.
 CAUSAL_ENTITIES = ["shipment_issue"]
 
+# Same category of miss again, for "history"/"timeline" questions: live query
+# "give me details about 400000000014 and their history of status" reached
+# Stage 4b (correctly — no template covers "details + history" together) but
+# the LLM drafted a query joining only shipments+customers, never touching
+# v_shipment_journey_summary or tracking_events, and its ANSWER THEN CLAIMED
+# no historical timeline existed — false; the shipment had 9 logged stages.
+# Root cause: neither v_shipment_journey_summary (which already has
+# journey_timeline pre-aggregated as a JSONB array — the exact answer to
+# "history of status") nor tracking_event scored into the top-k for this
+# query; their field/table names are about journey logging, not about
+# "details" or "history" as words, so Stage 4b's LLM never even saw either
+# existed. See AGENTIC_RAG_ARCHITECTURE.md §20.
+HISTORY_ENTITIES = ["v_shipment_journey_summary", "tracking_event"]
+
+_HISTORY_QUERY_RE = re.compile(
+    r"\bhistor(?:y|ical|ies)\b|\btimeline[s]?\b|\bjourney\b|\bprogression\b"
+    r"|\bpast\s+status(?:es)?\b|\bprevious\s+stage[s]?\b|\bstatus\s+histor(?:y|ies)\b"
+    r"|\btrack(?:ing)?\s+events?\b",
+    re.IGNORECASE,
+)
+
+
+def wants_history(query: str) -> bool:
+    """Shared naming/promotion pattern as is_causal_query/wants_individual_records
+    above — a query asking for a shipment's status HISTORY needs
+    v_shipment_journey_summary/tracking_event force-scoped the same way a
+    causal question needs shipment_issue, for the identical reason: the
+    relevant table's own vocabulary doesn't overlap with how users phrase
+    the question, so plain embedding similarity won't surface it."""
+    return bool(_HISTORY_QUERY_RE.search(query))
+
 # Live query: "what are the major blocker for international packages" carries
 # the same "explain what's wrong" intent as "why...", but the literal words
 # "why"/"reason"/"cause" never appear — verified this slipped through
@@ -164,6 +195,13 @@ def scope_schema(query: str, extracted=None, top_k: int = DEFAULT_TOP_K) -> Scop
 
     if is_causal_query(query):
         for entity in CAUSAL_ENTITIES:
+            if entity not in ranked and entity in scored_lookup:
+                ranked.append(entity)
+                scores[entity] = scored_lookup[entity]
+                forced.append(entity)
+
+    if wants_history(query):
+        for entity in HISTORY_ENTITIES:
             if entity not in ranked and entity in scored_lookup:
                 ranked.append(entity)
                 scores[entity] = scored_lookup[entity]
