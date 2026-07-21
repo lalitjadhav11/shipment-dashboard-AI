@@ -46,6 +46,24 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # Runs on EVERY `docker compose up` (not idempotent like seeder above) —
+  # appends SYNTHETIC_SHIPMENTS_COUNT new LLM-generated shipments on top of
+  # whatever's already there each time. See seeder/llm_augment_shipments.py.
+  llm_augmenter:
+    build: ./seeder
+    container_name: shipment_llm_augmenter
+    command: ["python", "llm_augment_shipments.py"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-shipdb_phase1}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AGENT_GEMINI_MODEL: ${AGENT_GEMINI_MODEL:-gemini-3.1-flash-lite}
+      SYNTHETIC_SHIPMENTS_COUNT: ${SYNTHETIC_SHIPMENTS_COUNT:-250}
+      SYNTHETIC_LLM_BATCH_SIZE: ${SYNTHETIC_LLM_BATCH_SIZE:-10}
+    depends_on:
+      seeder:
+        condition: service_completed_successfully
+    restart: "no"
+
   backend:
     build: ./backend
     container_name: shipment_backend
