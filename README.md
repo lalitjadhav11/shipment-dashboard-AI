@@ -44,21 +44,30 @@ for the full stage reference, the AI chat's grounded-context design
 | Frontend (React) — reporting dashboard: KPI row + searchable/filterable/paginated shipment table | ✅ Done (`frontend/src`) |
 | Shipment detail drawer — click a tracking ID for status, customs, delay info, and a Google Maps journey view (stops + flight/truck legs) | ✅ Done (`frontend/src/components/ShipmentDetailDrawer.jsx`, `JourneyMap.jsx`) |
 | **AI Shipment Journey Summary chat** (the feature the schema supports) | ⏳ Not yet implemented — `shipment_chat_log` and `v_shipment_journey_summary` are in place to support it |
+| **LLM data augmentation** — Gemini invents new shipment scenarios (city pair, package, status, delay reason) every `docker compose up`, appended on top of the base 25k | ✅ Done (`seeder/llm_augment_shipments.py`, run by the `llm_augmenter` service) |
 
 ## Architecture
 
 Three-tier stack, fully containerized:
 
-| Tier      | Tech             | Container           | Port (host) |
-|-----------|------------------|----------------------|-------------|
-| Frontend  | React (Vite)     | `shipment_frontend`  | `3000`      |
-| Backend   | Python (FastAPI) | `shipment_backend`   | `8000`      |
-| Database  | PostgreSQL 16    | `shipment_db`        | `5432`      |
-| Seeder    | Python (one-shot)| `shipment_seeder`    | —           |
+| Tier          | Tech             | Container                 | Port (host) |
+|---------------|------------------|----------------------------|-------------|
+| Frontend      | React (Vite)     | `shipment_frontend`        | `3000`      |
+| Backend       | Python (FastAPI) | `shipment_backend`         | `8000`      |
+| Database      | PostgreSQL 16    | `shipment_db`               | `5432`      |
+| Seeder        | Python (one-shot)| `shipment_seeder`           | —           |
+| LLM augmenter | Python (one-shot)| `shipment_llm_augmenter`    | —           |
 
 The database schema is created **automatically** on first boot (Postgres
 native `docker-entrypoint-initdb.d` init scripts), and the dataset is loaded
-by a one-shot, idempotent **seeder**.
+by a one-shot, idempotent **seeder**. On top of that, the **LLM augmenter**
+runs every single `docker compose up` (it is *not* idempotent) — it asks
+Gemini to invent `SYNTHETIC_SHIPMENTS_COUNT` (default 250) new shipment
+scenarios in the same style as the existing data, then builds and inserts
+full rows (IDs, timestamps, hub routing, journey timeline) around those
+scenarios in Python. The dataset grows by that amount on every restart if
+`GEMINI_API_KEY` is set; it's a no-op (skipped with a log line) if it's
+blank. See `seeder/llm_augment_shipments.py` for the full design rationale.
 
 ## Quick start (Docker)
 
