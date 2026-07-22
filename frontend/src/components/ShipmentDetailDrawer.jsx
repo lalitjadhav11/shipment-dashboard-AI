@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchShipmentDetail } from "../api.js";
-import { askAgent } from "../agentApi.js";
+import { fetchShipmentDetail, fetchShipmentAiSummary, askShipmentQuestion } from "../api.js";
 import { titleCase, formatLocation, formatTimestamp } from "../format.js";
 import StatusBadge from "./StatusBadge.jsx";
 import JourneyMap from "./JourneyMap.jsx";
@@ -13,6 +12,29 @@ function Field({ label, children }) {
       <div className="detail-field__value">{children}</div>
     </div>
   );
+}
+
+// A handful of direct, clickable starting points — mixing "about this
+// shipment" and "compared to other/similar orders" so the composer isn't
+// the only way in. Tailored to what's actually true of this shipment rather
+// than a fixed list (e.g. no customs question for a domestic shipment).
+function buildSuggestedQuestions(data) {
+  if (!data) return [];
+  const qs = [];
+  qs.push(
+    data.reason_for_delay && data.reason_for_delay !== "NONE"
+      ? "Why is this shipment delayed, and when is it expected to recover?"
+      : "Is this shipment on schedule?"
+  );
+  if (data.is_international) {
+    qs.push("What's the customs status, and has that held up other shipments on this route?");
+  }
+  if (data.org_name) {
+    qs.push(`What other shipments does ${data.org_name} have right now?`);
+  }
+  qs.push("How does this compare to similar shipments on the same route?");
+  qs.push("What's the average delivery time for this service type?");
+  return qs.slice(0, 4);
 }
 
 export default function ShipmentDetailDrawer({ trackingId, autoAiSummary, onClose }) {
@@ -28,9 +50,14 @@ export default function ShipmentDetailDrawer({ trackingId, autoAiSummary, onClos
   const open = Boolean(trackingId);
   const aiBusy = aiTurns.some((t) => t.loading);
 
-  // Keeps follow-up questions scoped to this shipment even if the user
-  // doesn't mention the tracking ID themselves — the backend has no notion
-  // of "current drawer context," so each request has to carry it explicitly.
+  // Goes through the drawer's own /ask endpoint rather than the general
+  // /api/chat pipeline — that pipeline classifies against 28 fixed templates,
+  // which tends to match a narrow single-field template for a compound
+  // "how does this compare to others" question and ignore the comparative
+  // half entirely. This endpoint always hands the LLM the primary shipment
+  // AND a sample of related shipments (same customer or same route), so it
+  // can actually answer comparative follow-ups instead of just restating
+  // the primary shipment's own field.
   const ask = useCallback((rawQuery) => {
     const query = rawQuery.trim();
     if (!query || !trackingId) return;
@@ -39,14 +66,10 @@ export default function ShipmentDetailDrawer({ trackingId, autoAiSummary, onClos
     const controller = new AbortController();
     aiAbortRef.current = controller;
 
-    const scopedQuery = query.toLowerCase().includes(trackingId.toLowerCase())
-      ? query
-      : `${query} for shipment ${trackingId}`;
-
     const id = ++aiTurnIdRef.current;
     setAiTurns((prev) => [...prev, { id, query, loading: true, answer: null, error: null }]);
 
-    askAgent(scopedQuery, { signal: controller.signal })
+    askShipmentQuestion(trackingId, query, { signal: controller.signal })
       .then((detail) => {
         if (controller.signal.aborted) return;
         setAiTurns((prev) => prev.map((t) => (t.id === id ? { ...t, loading: false, answer: detail } : t)));
@@ -58,6 +81,35 @@ export default function ShipmentDetailDrawer({ trackingId, autoAiSummary, onClos
         )));
       });
   }, [trackingId]);
+
+  // The auto-triggered opening summary uses a dedicated endpoint that hands
+  // the LLM the full shipment record directly (see /api/shipments/{id}/ai-summary)
+  // — the general chat pipeline's intent classifier tends to match an
+  // open-ended "summarize this" question to one narrow single-field
+  // template, which reads as terse rather than a real detailed summary.
+  const fetchDetailedSummary = useCallback((id) => {
+    if (!id) return;
+    aiAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+
+    const turnId = ++aiTurnIdRef.current;
+    setAiTurns((prev) => [...prev, { id: turnId, query: null, loading: true, answer: null, error: null }]);
+
+    fetchShipmentAiSummary(id, { signal: controller.signal })
+      .then((res) => {
+        if (controller.signal.aborted) return;
+        setAiTurns((prev) => prev.map((t) => (
+          t.id === turnId ? { ...t, loading: false, answer: { answer: res.summary } } : t
+        )));
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        setAiTurns((prev) => prev.map((t) => (
+          t.id === turnId ? { ...t, loading: false, error: err.message || "Couldn't get a detailed summary." } : t
+        )));
+      });
+  }, []);
 
   useEffect(() => {
     if (!trackingId) return;
@@ -82,10 +134,10 @@ export default function ShipmentDetailDrawer({ trackingId, autoAiSummary, onClos
     setAiInput("");
     if (!trackingId || !autoAiSummary) return;
 
-    ask(`Give me a summary of shipment ${trackingId}`);
+    fetchDetailedSummary(trackingId);
 
     return () => aiAbortRef.current?.abort();
-  }, [trackingId, autoAiSummary, ask]);
+  }, [trackingId, autoAiSummary, fetchDetailedSummary]);
 
   function handleAiSubmit(event) {
     event.preventDefault();
@@ -179,21 +231,32 @@ export default function ShipmentDetailDrawer({ trackingId, autoAiSummary, onClos
                       {!turn.loading && !turn.error && turn.answer && (
                         <>
                           <p className="drawer-ai-summary__text">{turn.answer.answer}</p>
-                          {turn.answer.follow_up_suggestions?.length > 0 && (
-                            <div className="drawer-ai-summary__suggestions">
-                              {turn.answer.follow_up_suggestions.map((prompt) => (
-                                <button
-                                  key={prompt}
-                                  type="button"
-                                  className="drawer-ai-summary__chip"
-                                  onClick={() => ask(prompt)}
-                                  disabled={aiBusy}
-                                >
-                                  {prompt}
-                                </button>
-                              ))}
-                            </div>
-                          )}
+                          {(() => {
+                            // Turn 0 (the detailed summary) comes from a plain
+                            // data endpoint with no suggestions of its own —
+                            // offer curated, data-aware direct questions there.
+                            // Later turns use the general assistant's own
+                            // dynamic follow-ups.
+                            const prompts = i === 0
+                              ? buildSuggestedQuestions(data)
+                              : (turn.answer.follow_up_suggestions || []);
+                            if (prompts.length === 0) return null;
+                            return (
+                              <div className="drawer-ai-summary__suggestions">
+                                {prompts.map((prompt) => (
+                                  <button
+                                    key={prompt}
+                                    type="button"
+                                    className="drawer-ai-summary__chip"
+                                    onClick={() => ask(prompt)}
+                                    disabled={aiBusy}
+                                  >
+                                    {prompt}
+                                  </button>
+                                ))}
+                              </div>
+                            );
+                          })()}
                         </>
                       )}
                     </div>

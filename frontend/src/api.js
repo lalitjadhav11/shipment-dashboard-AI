@@ -3,8 +3,8 @@
 // Exported so sibling service modules (e.g. agentApi.js) share one source of truth.
 export const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
-async function getJson(path) {
-  const res = await fetch(`${API_BASE}${path}`);
+async function getJson(path, { signal } = {}) {
+  const res = await fetch(`${API_BASE}${path}`, { signal });
   if (!res.ok) {
     throw new Error(`${path} -> HTTP ${res.status}`);
   }
@@ -17,6 +17,23 @@ export function fetchSummary() {
 
 export function fetchShipmentDetail(trackingId) {
   return getJson(`/api/shipments/${encodeURIComponent(trackingId)}`);
+}
+
+export function fetchShipmentAiSummary(trackingId, { signal } = {}) {
+  return getJson(`/api/shipments/${encodeURIComponent(trackingId)}/ai-summary`, { signal });
+}
+
+export async function askShipmentQuestion(trackingId, query, { signal } = {}) {
+  const res = await fetch(`${API_BASE}/api/shipments/${encodeURIComponent(trackingId)}/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+    signal,
+  });
+  if (!res.ok) {
+    throw new Error(`/api/shipments/${trackingId}/ask -> HTTP ${res.status}`);
+  }
+  return res.json();
 }
 
 export function fetchShipments({
