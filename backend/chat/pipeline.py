@@ -260,6 +260,22 @@ def run_pipeline(query: str):
                 "intent": resolved_intent,
             }}
             filled = None
+        elif schema_scope.wants_history(query) and not sql_templates.TEMPLATES[resolved_intent].shows_full_history:
+            # Live bug: "give me the status history for 800000000073" matched
+            # where_is_my_package (tracking_id present, fills trivially) and returned
+            # "currently OUT_FOR_DELIVERY, last seen at Melbourne" — true, but not a history,
+            # since that formatter only reads the LAST hop of journey_timeline even though the
+            # SQL happens to select the whole thing. Same shape as the causal/aggregate gates
+            # above: a successfully-filled template whose ANSWER doesn't actually address what
+            # was asked is not an answer. Discard it and let Stage 4b narrate the full timeline
+            # instead. See AGENTIC_RAG_ARCHITECTURE.md §22.
+            yield {"stage": "history_query_needs_llm", "detail": {
+                "reason": "the query asks for status HISTORY/timeline, but the matched "
+                          "template's answer only reports the current/last-known stage — "
+                          "routing to Stage 4b so the full journey can be narrated",
+                "intent": resolved_intent,
+            }}
+            filled = None
 
     if filled is None:
         # Stage 4a is exhausted — either nothing matched, or something matched

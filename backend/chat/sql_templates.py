@@ -54,6 +54,13 @@ class TemplateSpec:
     # X shipments" no matter how confidently Stage 1 matches them. pipeline.py declines a match
     # here when schema_scope.wants_individual_records() is True, the same pattern as
     # explains_causation above — see AGENTIC_RAG_ARCHITECTURE.md §18.
+    shows_full_history: bool = False  # True only for templates whose FORMATTED ANSWER narrates
+    # the full journey timeline, not just the current/last-known stage. where_is_my_package and
+    # why_is_it_late both select journey_timeline in their SQL, but their formatters only read
+    # the LAST hop — so a "give me the status history" question that matches either one still
+    # gets a same non-history answer. pipeline.py declines a match here when
+    # schema_scope.wants_history() is True, the same pattern as explains_causation/is_aggregate
+    # above — see AGENTIC_RAG_ARCHITECTURE.md §22. No template qualifies today.
 
 
 def _tracking_id_params(entities):
