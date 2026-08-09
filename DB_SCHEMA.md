@@ -166,6 +166,11 @@ it can insert its own back-dated, authoritative history instead).
 | `user_query` / `ai_response` | `TEXT` | |
 | `context_snapshot` | `JSONB` | |
 | `confidence_score` | `NUMERIC(5,4)` | |
+| `source` | `VARCHAR(20)` | `'template'` \| `'llm'` \| `NULL` (declined before any SQL existed — multi-tracking-id/multi-org-name guard) |
+| `llm_provider` | `VARCHAR(20)` | `'anthropic'` \| `'gemini'` \| `'ollama'` \| `NULL`; only set when `source='llm'` |
+| `llm_model` | `VARCHAR(80)` | `NULL` unless `source='llm'` |
+| `guardrail_status` | `VARCHAR(20)` | `'accepted'` \| `'rejected'` \| `NULL` (`NULL` = guardrail never ran) |
+| `latency_ms` | `NUMERIC(10,1)` | end-to-end pipeline wall-clock time |
 | `created_at` | `TIMESTAMPTZ` | |
 
 ## Enum types
@@ -213,6 +218,7 @@ dashboard and the chat agent's 10 aggregate templates.
 | `v_service_level_mix` | Shipment count + on-time %, grouped by `delivery_type` |
 | `v_top_customers` | Top 25 customers by shipment volume, with each one's own on-time % |
 | `v_chat_activity_summary` | Total chat interactions, distinct shipments discussed, avg confidence, low-confidence count |
+| `v_chat_llm_usage` | Template-vs-LLM chat traffic split, by provider — interaction count, % of total, avg latency, guardrail rejections. Backs `GET /api/chat/llm-usage`. |
 | `v_dashboard_headline` | Single-row, ten-KPI snapshot for the dashboard header — one query, no joins needed by the caller |
 
 ## Indexes

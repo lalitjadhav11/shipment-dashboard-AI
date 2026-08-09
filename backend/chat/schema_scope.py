@@ -77,6 +77,25 @@ CAUSAL_ENTITIES = ["shipment_issue"]
 # existed. See AGENTIC_RAG_ARCHITECTURE.md §20.
 HISTORY_ENTITIES = ["v_shipment_journey_summary", "tracking_event"]
 
+# Symmetric opposite of the force-INCLUDE lists above: tables that must
+# NEVER be exposed via the natural-language query surface, regardless of how
+# they score. shipment_chat_log holds every user's raw user_query/
+# ai_response/customer_id — with no auth/session model in Phase 1, anyone
+# could ask a plausible-sounding question and read other customers' chat
+# history verbatim. Verified live (not hypothetical): it scores into the
+# top-4 for entirely ordinary phrasings — including "how is the AI chat
+# feature being used", the EXACT example_nl for the legitimate
+# chat_activity_summary intent — right alongside its own aggregate view,
+# v_chat_activity_summary, which is what should actually answer that
+# question. Stage 5's guardrail only checks "is this table in the
+# Stage-3-scoped allow-list" — it has no concept of a table that should
+# never be allow-listed at all, so this has to be enforced here, before
+# scoping even happens (see guardrails.py's FORBIDDEN_TABLES for the
+# independent, defense-in-depth backstop). Excluding the raw table doesn't
+# affect the legitimate chat_activity_summary v0 template — that template's
+# entity_keys is ("v_chat_activity_summary",), a different schema key.
+NEVER_SCOPE_ENTITIES = {"shipment_chat_log"}
+
 _HISTORY_QUERY_RE = re.compile(
     r"\bhistor(?:y|ical|ies)\b|\btimeline[s]?\b|\bjourney\b|\bprogression\b"
     r"|\bpast\s+status(?:es)?\b|\bprevious\s+stage[s]?\b|\bstatus\s+histor(?:y|ies)\b"
@@ -149,6 +168,87 @@ def is_causal_query(query: str) -> bool:
     return bool(_CAUSAL_QUERY_RE.search(query))
 
 
+# Live bug: "group shipments by package type and show how many are delayed"
+# — the exact query AGENTIC_RAG_ARCHITECTURE.md §9 originally used to prove
+# Stage 4b's GROUP BY capability — confidently matches delay_reason_breakdown
+# (0.634) and answers with a breakdown by REASON, silently ignoring "by
+# package type" entirely. Same family as is_causal_query/
+# wants_individual_records above (a successfully-filled AGGREGATE template
+# is not the right answer if it aggregates along the wrong axis), but a new
+# signal: neither is_causal_query nor wants_individual_records fires here
+# (verified live — no causal wording, and no identified entity/list phrasing),
+# because the mismatch isn't "wrong SHAPE of answer", it's "right shape,
+# wrong grouping column."
+_GROUP_SIGNAL_RE = re.compile(
+    r"\bgroup(?:ed|ing)?\b|\bbroken\s+down\b|\bbreak(?:s|ing)?\s+down\b|\bsplit\b",
+    re.IGNORECASE,
+)
+# Captures the phrase after "by", stopping at "and"/punctuation/end-of-string
+# — "group shipments BY PACKAGE TYPE and show how many..." -> "package type".
+_GROUP_BY_PHRASE_RE = re.compile(
+    r"\bby\s+([a-z][a-z\s]{2,30}?)(?:\s+and\b|\s*[,.?!]|$)",
+    re.IGNORECASE,
+)
+
+# Canonical dimension name -> phrases that indicate the user asked to group
+# by it. Only consulted when _GROUP_SIGNAL_RE already matched, so an ordinary
+# query mentioning "by" (e.g. "top customers BY VOLUME") never even reaches
+# this — verified live against the golden query set before committing (see
+# CHAT_TEST_QUERIES.md's top_customers_by_volume/service_level_mix examples,
+# none of which contain a group/split word).
+_GROUP_BY_DIMENSION_KEYWORDS = {
+    "package_type": ["package type", "package types"],
+    "package_size": ["package size", "package sizes"],
+    "current_status": ["status"],
+    "reason_for_delay": ["delay reason", "reason for delay", "reason", "delay"],
+    "shipment_scope": ["international", "domestic", "scope"],
+    "delivery_type": ["delivery type", "service level", "delivery types"],
+    "customer": ["customer", "org", "shipper", "account"],
+    "day": ["day", "date", "daily"],
+}
+
+# What each is_aggregate template ACTUALLY groups its rows by — the ground
+# truth wants_different_grouping() below compares a detected request against.
+# Templates not listed (dashboard_headline, ontime_performance,
+# chat_activity_summary, ops_daily_briefing) are single-row or group by a
+# fixed pair of columns the user can't meaningfully ask to swap out.
+TEMPLATE_GROUPING_DIMENSION = {
+    "status_breakdown": "current_status",
+    "delay_reason_breakdown": "reason_for_delay",
+    "domestic_vs_international_split": "shipment_scope",
+    "service_level_mix": "delivery_type",
+    "top_customers_by_volume": "customer",
+    "daily_volume_trend": "day",
+}
+
+
+def _extract_group_by_dimension(query: str) -> str | None:
+    if not _GROUP_SIGNAL_RE.search(query):
+        return None
+    match = _GROUP_BY_PHRASE_RE.search(query)
+    if not match:
+        return None
+    phrase = match.group(1).lower()
+    for dimension, keywords in _GROUP_BY_DIMENSION_KEYWORDS.items():
+        if any(kw in phrase for kw in keywords):
+            return dimension
+    return None
+
+
+def wants_different_grouping(query: str, resolved_intent: str) -> bool:
+    """True when the query explicitly asks to group/break down shipments by
+    a dimension that doesn't match what `resolved_intent`'s aggregate
+    template actually groups by (including templates not in
+    TEMPLATE_GROUPING_DIMENSION at all, e.g. dashboard_headline — those
+    can't satisfy ANY explicit grouping request). pipeline.py only consults
+    this when the matched template is_aggregate; a non-aggregate template
+    match is a different kind of question entirely, not this failure shape."""
+    desired = _extract_group_by_dimension(query)
+    if desired is None:
+        return False
+    return TEMPLATE_GROUPING_DIMENSION.get(resolved_intent) != desired
+
+
 @dataclass
 class ScopedSchema:
     entities: list  # ranked entity/view keys, best match first
@@ -177,10 +277,18 @@ def scope_schema(query: str, extracted=None, top_k: int = DEFAULT_TOP_K) -> Scop
 
     q_vec = schema_loader.embed(query)
     scored = sorted(
-        ((name, schema_loader.cosine(q_vec, vec)) for name, vec in schema_index.items()),
+        (
+            (name, schema_loader.cosine(q_vec, vec))
+            for name, vec in schema_index.items()
+            if name not in NEVER_SCOPE_ENTITIES
+        ),
         key=lambda t: -t[1],
     )
     scored_lookup = dict(scored)
+    # Filtered out of `scored`/`scored_lookup` above, not just the final
+    # return — this is what stops the RECORD_LEVEL/CAUSAL/HISTORY force-
+    # include loops below from ever being able to re-add a never-scope
+    # entity via `entity in scored_lookup`.
 
     ranked = [name for name, _ in scored[:top_k]]
     scores = {name: score for name, score in scored[:top_k]}

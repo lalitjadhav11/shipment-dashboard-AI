@@ -86,6 +86,17 @@ services:
       # host.docker.internal resolves to the host machine from inside the
       # container — Ollama runs on the host, not in this Compose stack.
       AGENT_OLLAMA_HOST: ${AGENT_OLLAMA_HOST:-http://host.docker.internal:11434}
+      # Phase 2 reliability (llm_client.py) — all optional, sensible defaults.
+      # Escalation model for the ONE retry after a Stage 5 guardrail
+      # rejection of Stage 4b's SQL; unset means the retry reuses the same
+      # model with the rejection reason fed back into the prompt.
+      AGENT_LLM_ESCALATION_MODEL: ${AGENT_LLM_ESCALATION_MODEL:-}
+      # Circuit breaker: after this many consecutive LLM failures, calls
+      # fail fast (no attempt) for this many seconds instead of waiting out
+      # a real timeout per request — aimed at Ollama's no-forced-tool-choice
+      # reliability gap but applies to all three providers.
+      AGENT_LLM_CIRCUIT_THRESHOLD: ${AGENT_LLM_CIRCUIT_THRESHOLD:-3}
+      AGENT_LLM_CIRCUIT_COOLDOWN_SECONDS: ${AGENT_LLM_CIRCUIT_COOLDOWN_SECONDS:-60}
     depends_on:
       db:
         condition: service_healthy

@@ -139,7 +139,32 @@ SELECT
 FROM shipment_chat_log;
 
 -- -----------------------------------------------------------------------------
--- 10. One-shot "everything" snapshot — single round trip for a dashboard header
+-- 10. AI chat template-vs-LLM usage split, by provider — an ops signal for
+--     the "minimize LLM load" design goal: what fraction of real traffic
+--     actually falls through to Stage 4b/7v1, at what latency, and how often
+--     guardrail rejects the drafted SQL. NULL source/llm_provider means a
+--     pure decline (multi-tracking-id/multi-org-name guard) that never
+--     generated SQL at all — grouped as its own row via COALESCE, not
+--     dropped, since "how often do we decline outright" is itself a useful
+--     number.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_chat_llm_usage AS
+SELECT
+  COALESCE(source, 'declined') AS source,
+  COALESCE(llm_provider, 'n/a') AS llm_provider,
+  count(*) AS interaction_count,
+  round(100.0 * count(*) / NULLIF((SELECT count(*) FROM shipment_chat_log), 0), 2) AS pct_of_total,
+  round(avg(latency_ms), 1) AS avg_latency_ms,
+  count(*) FILTER (WHERE guardrail_status = 'rejected') AS guardrail_rejections
+FROM shipment_chat_log
+GROUP BY source, llm_provider
+ORDER BY interaction_count DESC;
+
+COMMENT ON VIEW v_chat_llm_usage IS
+  'Template-vs-LLM chat traffic split, by provider — latency + guardrail-rejection ops signal.';
+
+-- -----------------------------------------------------------------------------
+-- 11. One-shot "everything" snapshot — single round trip for a dashboard header
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_dashboard_headline AS
 SELECT

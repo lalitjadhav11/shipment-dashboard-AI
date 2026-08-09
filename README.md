@@ -167,6 +167,7 @@ stack to another machine.
 | GET    | `/api/status-breakdown` | `v_status_breakdown`                      |
 | POST   | `/api/chat`              | AI Shipment Journey Summary chat — streams Server-Sent Events, one per pipeline stage, ending with `answer_ready`. Send `{"query": "..."}`. Falls back to Stage 4b (LLM) when no template matches, if `ANTHROPIC_API_KEY` is set — see status table above. |
 | GET    | `/api/chat/history`      | Read `shipment_chat_log` for QA (optional `?tracking_id=`) |
+| GET    | `/api/chat/llm-usage`    | `v_chat_llm_usage` — template-vs-LLM traffic split by provider, with avg latency and guardrail-rejection counts |
 
 | GET    | `/api/shipments`        | Paginated shipment listing — `page`, `page_size` (default 50), `search`, `status`, `delivery_type`, `is_international`, `customs_status`, `sort_by`, `sort_dir` |
 | GET    | `/api/shipments/{tracking_id}` | `v_shipment_journey_summary` for one shipment — status, customs, delay, open issues, full journey timeline. Backs the detail drawer + journey map. |
@@ -183,6 +184,58 @@ curl -N -X POST http://localhost:8000/api/chat \
   -H "Content-Type: application/json" -H "X-User-Role: OPS" \
   -d '{"query": "Why is my package <a real tracking_id> delayed?"}'
 ```
+## Chat pipeline regression suite
+
+`backend/tests/` is an executable version of `CHAT_TEST_QUERIES.md` — one intent-classification
+assertion per template, plus the documented routing edge cases (multi-tracking-ID decline, the
+bare-ID default, the fleet-intent override guard, the causal/aggregate "successfully-filled
+template isn't necessarily the right one" gates) and Stage 5 guardrail checks for every template.
+It runs offline — no live Postgres or LLM call — by pre-loading the embedding model once per
+session and monkeypatching the org-name/city fuzzy-match caches with fixture data, so it finishes
+in a few seconds and is safe to run before every commit:
+
+```bash
+docker compose up -d db backend   # only these two services are needed
+docker compose exec backend pytest -v
+```
+
+Building it surfaced one real, previously-undocumented gap: comparing two named customers
+("compare Acme Corp and Globex") used to silently answer about only the first — the same failure
+shape the multi-tracking-ID guard already prevented, just never extended to `org_name`. Fixed by
+adding `entities.py`'s `org_names` (plural — mirrors `tracking_ids`) and a matching
+`multiple_org_names_detected` guard in `pipeline.py`; `test_multi_customer_comparison_declines_without_guessing`
+regression-guards it.
+
+## Chat pipeline observability
+
+`shipment_chat_log` now records, per interaction: `source` (`template`/`llm`/`NULL` for a pure
+decline), `llm_provider`/`llm_model` (only when `source='llm'`), `guardrail_status`
+(`accepted`/`rejected`/`NULL`), and `latency_ms` (end-to-end pipeline wall-clock time) — turning
+the audit log into an actual ops signal for the "minimize LLM load" design goal, instead of
+something only answerable by grepping container logs. `GET /api/chat/llm-usage`
+(`v_chat_llm_usage`) surfaces the aggregate: template-vs-LLM traffic split by provider, with avg
+latency and guardrail-rejection counts. Existing rows from before this change have these columns
+`NULL` — expected, not a data-quality bug.
+
+## Chat pipeline reliability (Phase 2)
+
+Two additions to `llm_client.py`/`sql_llm.py`/`pipeline.py`, both named as intended design in
+`AGENTIC_RAG_ARCHITECTURE.md` at Stage 4b's original write-up but never actually built until now:
+
+- **Guardrail-rejection retry.** When Stage 5 rejects Stage 4b's drafted SQL, it now gets exactly
+  one retry — the rejection reason and the failed SQL are fed back into the prompt (`sql_generated`
+  fires a second time with `"retry": true` if it succeeds), instead of declining outright on the
+  first mistake. Optionally escalates to a different model via `AGENT_LLM_ESCALATION_MODEL`
+  (unset by default — the retry then just reuses the same model with feedback). Only applies to
+  `source="llm"` — a rejected *template's* SQL is a bug in hand-written code, not something a
+  prompt retry can fix, so it still declines immediately.
+- **Per-provider circuit breaker.** After `AGENT_LLM_CIRCUIT_THRESHOLD` (default 3) consecutive
+  LLM failures — a hard error or a response with no usable tool call, the same "provider isn't
+  giving usable output" signal either way — `call_tool()` fails fast for
+  `AGENT_LLM_CIRCUIT_COOLDOWN_SECONDS` (default 60) instead of waiting out a real timeout on every
+  subsequent request. Aimed at the documented Ollama no-forced-tool-choice reliability gap, but
+  applies uniformly to all three providers, tracked independently per provider.
+
 ## Configuration
 
 All settings have defaults; override by copying `.env.example` to `.env`:
@@ -203,4 +256,7 @@ All settings have defaults; override by copying `.env.example` to `.env`:
 | `AGENT_GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini model, used only when that provider is active — the 3.x preview line is what's actually reachable on a new project's free tier at the time this was set up; the 2.x stable models returned "not available to new users" |
 | `AGENT_OLLAMA_MODEL` | `llama3.1`     | Ollama model tag — must already be pulled (`ollama pull <model>`) and support tool/function calling |
 | `AGENT_OLLAMA_HOST` | `http://host.docker.internal:11434` | Where the backend container reaches Ollama running on the host |
+| `AGENT_LLM_ESCALATION_MODEL` | *(none)* | Model to retry with after a Stage 5 guardrail rejection of Stage 4b's SQL; unset reuses the same model with the rejection reason fed back into the prompt instead |
+| `AGENT_LLM_CIRCUIT_THRESHOLD` | `3` | Consecutive LLM failures before the circuit breaker opens and calls fail fast instead of attempting |
+| `AGENT_LLM_CIRCUIT_COOLDOWN_SECONDS` | `60` | How long the circuit stays open before allowing a half-open trial call |
 | `VITE_GOOGLE_MAPS_API_KEY` | *(empty)* | Google Maps JavaScript API key for the shipment detail drawer's journey map. Without it, the drawer shows a "map disabled" placeholder instead of erroring. Baked into the static frontend build at image-build time — rebuild the frontend after changing it (`docker compose up --build frontend`). |

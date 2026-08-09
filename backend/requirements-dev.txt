@@ -1,0 +1,5 @@
+# Test-only dependencies for the pytest regression suite (backend/tests/).
+# Kept in a separate file (installed in its own Docker layer, see Dockerfile)
+# so adding/upgrading a test tool never invalidates the slow, torch-downloading
+# production dependency layer built from requirements.txt.
+pytest==8.3.3

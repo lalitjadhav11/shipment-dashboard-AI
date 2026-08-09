@@ -10,8 +10,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
  && pip install --no-cache-dir -r requirements.txt
 
+# Separate layer/file from requirements.txt on purpose — see requirements-dev.txt's
+# own comment: keeps the pytest suite's deps from invalidating the torch layer above.
+COPY requirements-dev.txt .
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
 COPY main.py .
 COPY chat/ ./chat/
+COPY tests/ ./tests/
+COPY pytest.ini .
 
 EXPOSE 8000
 

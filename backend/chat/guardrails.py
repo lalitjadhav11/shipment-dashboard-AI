@@ -19,6 +19,15 @@ from . import schema_loader
 DEFAULT_ROW_LIMIT = 200
 _PSYCOPG2_PARAM_RE = re.compile(r"%\(\w+\)s")
 
+# Independent backstop for schema_scope.py's NEVER_SCOPE_ENTITIES — real
+# table names (schema_loader.table_name() output), not schema-JSON entity
+# keys, since this checks the actual parsed SQL, not what Stage 3 scoped.
+# Even if a future template or a Stage 3 bug ever put shipment_chat_log's
+# entity key into the allow-list passed to validate_sql(), this still
+# rejects it: two independent layers agreeing "never" is what makes this
+# defense-in-depth rather than one check duplicated.
+FORBIDDEN_TABLES = {"shipment_chat_log"}
+
 
 class GuardrailError(Exception):
     pass
@@ -94,6 +103,9 @@ def validate_sql(sql: str, allowed_entity_keys: list) -> str:
     tables = {t.name for t in tree.find_all(exp.Table)}
     if not tables:
         raise GuardrailError("query does not reference any table")
+    forbidden_hit = tables & FORBIDDEN_TABLES
+    if forbidden_hit:
+        raise GuardrailError(f"query references forbidden tables: {forbidden_hit}")
     if not tables <= allowed_tables:
         raise GuardrailError(
             f"query references tables outside the scoped allow-list: {tables - allowed_tables}"

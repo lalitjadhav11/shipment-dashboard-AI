@@ -132,11 +132,33 @@ def _history_guidance(scoped_entities: list, query: str) -> str:
     )
 
 
-def _build_system_prompt(scoped_entities: list, query: str, available_params: dict) -> str:
+def _retry_guidance(previous_sql: str | None, retry_context: str | None) -> str:
+    """Corrective-feedback section for the guardrail-rejection retry (see
+    pipeline.py's escalation ladder — named in this file's original design
+    doc, AGENTIC_RAG_ARCHITECTURE.md §4 Stage 4b: "escalate...only if Stage 5
+    rejects the SQL twice in a row", never actually built until now). Empty
+    string on a first attempt (no previous_sql/retry_context yet) — this must
+    never appear in the prompt for the common, non-retry case."""
+    if not retry_context:
+        return ""
+    previous_sql_block = f"\nYOUR PREVIOUS ATTEMPT:\n{previous_sql}\n" if previous_sql else ""
+    return (
+        f"\nYOUR PREVIOUS ATTEMPT WAS REJECTED. Reason: {retry_context}\n{previous_sql_block}"
+        "Write a corrected query that fixes this specific problem — do not repeat the same "
+        "mistake. If the rejection was about an unknown table/column, only use what SCHEMA "
+        "above actually lists.\n"
+    )
+
+
+def _build_system_prompt(
+    scoped_entities: list, query: str, available_params: dict,
+    *, previous_sql: str | None = None, retry_context: str | None = None,
+) -> str:
     schema_text = schema_loader.describe_entities(scoped_entities)
     examples_text = _few_shot_examples(query)
     causal_text = _causal_guidance(scoped_entities, query)
     history_text = _history_guidance(scoped_entities, query)
+    retry_text = _retry_guidance(previous_sql, retry_context)
     params_text = (
         ", ".join(f"%({k})s = {v!r}" for k, v in available_params.items())
         if available_params else "(none extracted from this query)"
@@ -147,7 +169,7 @@ CURRENT DATE/TIME: {datetime.now(timezone.utc).isoformat()}
 
 SCHEMA (the only tables/columns that exist — do not reference anything else):
 {schema_text}
-{causal_text}{history_text}
+{causal_text}{history_text}{retry_text}
 AVAILABLE PARAMETERS (reference these by %(name)s in your SQL — never write their values as literals):
 {params_text}
 NOTE on %(date)s specifically, if listed above: it is already the FULLY-RESOLVED absolute
@@ -188,18 +210,30 @@ def _validate_placeholders(sql: str, available_params: dict) -> bool:
     return referenced <= set(available_params.keys())
 
 
-def draft_sql(query: str, scoped_entities: list, entities) -> FilledTemplate | None:
+def draft_sql(
+    query: str, scoped_entities: list, entities,
+    *, previous_sql: str | None = None, retry_context: str | None = None,
+    model_override: str | None = None,
+) -> FilledTemplate | None:
+    """`previous_sql`/`retry_context`/`model_override` are only passed by
+    pipeline.py's guardrail-rejection retry (see run_pipeline's escalation
+    ladder) — a first attempt always omits them, so the prompt/model stay
+    exactly as before for the common case."""
     if not scoped_entities:
         return None
 
     available_params = _available_params(entities)
-    system_prompt = _build_system_prompt(scoped_entities, query, available_params)
+    system_prompt = _build_system_prompt(
+        scoped_entities, query, available_params,
+        previous_sql=previous_sql, retry_context=retry_context,
+    )
 
     result = llm_client.call_tool(
         system_prompt=system_prompt,
         user_message=query,
         tool_name=TOOL_NAME,
         tool_schema=TOOL_SCHEMA,
+        model_override=model_override,
     )
     if result is None or not result.get("sql"):
         return None
@@ -211,4 +245,21 @@ def draft_sql(query: str, scoped_entities: list, entities) -> FilledTemplate | N
     if "LIMIT" not in sql.upper():
         sql += "\nLIMIT 200"
 
-    return FilledTemplate(sql=sql, params=available_params, entity_keys=scoped_entities, source="llm")
+    # Narrow to only the placeholders this SQL actually references — NOT the
+    # full available_params superset. Live bug: "group shipments by package
+    # type and show how many are delayed" spuriously enum-matches
+    # current_status=PACKAGE_RECEIVED ("package" prefix-matches
+    # PACKAGE_RECEIVED — the exact "harmless noise" documented in §10's
+    # entities.py docstring, for the v0 template path where each template's
+    # param builder only reads its own key). It's NOT harmless here: the
+    # LLM correctly didn't filter on it, but passing the full superset to
+    # Stage 7's synthesize() (_filter_context's "PARAMETER VALUES USED")
+    # falsely told it that value HAD been applied as a filter, and the
+    # synthesized answer then fabricated "these numbers are for shipments
+    # with a status of PACKAGE_RECEIVED" — a filter that was never in the
+    # SQL at all. Fixing at the source (what params ever reach downstream)
+    # rather than patching synthesize.py's prompt to distrust its own input.
+    referenced = set(_PLACEHOLDER_RE.findall(sql))
+    used_params = {k: v for k, v in available_params.items() if k in referenced}
+
+    return FilledTemplate(sql=sql, params=used_params, entity_keys=scoped_entities, source="llm")

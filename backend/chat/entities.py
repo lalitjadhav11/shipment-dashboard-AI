@@ -58,6 +58,10 @@ class ExtractedEntities:
     # silently answering about only the first ID is a worse failure than declining.
     enum_matches: dict = field(default_factory=dict)  # field_name -> matched value
     org_name: str | None = None
+    org_names: list = field(default_factory=list)  # ALL fuzzy-matched customer names — see
+    # pipeline.py's multi-org-name guard: no v0 template can compare multiple customers, and
+    # silently answering about only the first (org_name, kept for backward compat) is a worse
+    # failure than declining — same reasoning as tracking_id/tracking_ids above.
     location: str | None = None  # city fuzzy-matched from src_loc/dest_loc
     dates: list = field(default_factory=list)
     scores: dict = field(default_factory=dict)  # value -> match score, for the trace
@@ -161,14 +165,25 @@ def _load_org_names() -> list:
     return names
 
 
-def _extract_org_name(query: str) -> tuple:
+def _extract_org_names(query: str) -> list:
+    """ALL customer names that fuzzy-match the query above threshold, ranked
+    best-first — not just process.extractOne's single best hit. Needed so
+    the pipeline can detect (and decline, mirroring the multi-tracking-id
+    guard's precedent) a query that names more than one real customer
+    ("compare Acme Corp and Globex"), instead of silently picking one and
+    ignoring the rest. See pipeline.py's multiple_org_names_detected guard
+    and AGENTIC_RAG_ARCHITECTURE.md §9 for the identical failure shape this
+    mirrors for tracking IDs."""
     names = _load_org_names()
     if not names:
-        return None, 0.0
-    hit = process.extractOne(query, names, scorer=fuzz.partial_ratio, processor=fuzz_utils.default_process)
-    if hit and hit[1] >= FUZZY_MATCH_THRESHOLD:
-        return hit[0], hit[1]
-    return None, 0.0
+        return []
+    hits = process.extract(
+        query, names, scorer=fuzz.partial_ratio, processor=fuzz_utils.default_process,
+        limit=len(names),
+    )
+    matches = [(name, score) for name, score, _ in hits if score >= FUZZY_MATCH_THRESHOLD]
+    matches.sort(key=lambda pair: -pair[1])
+    return matches
 
 
 def _load_city_names() -> list:
@@ -213,10 +228,12 @@ def extract_entities(query: str) -> ExtractedEntities:
     result.tracking_id = result.tracking_ids[0] if result.tracking_ids else None
     result.enum_matches = _extract_enum_matches(query, schema)
 
-    org_name, org_score = _extract_org_name(query)
-    if org_name:
-        result.org_name = org_name
-        result.scores[org_name] = org_score
+    org_matches = _extract_org_names(query)
+    if org_matches:
+        result.org_name = org_matches[0][0]
+        result.org_names = [name for name, _ in org_matches]
+        for name, score in org_matches:
+            result.scores[name] = score
 
     location, location_score = _extract_location(query)
     if location:

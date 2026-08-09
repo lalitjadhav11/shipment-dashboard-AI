@@ -57,3 +57,16 @@ def chat_history(tracking_id: str | None = None, limit: int = 20):
         cur.execute(sql, params)
         rows = cur.fetchall()
     return clean_rows(rows)
+
+
+@router.get("/llm-usage")
+def chat_llm_usage():
+    """Template-vs-LLM traffic split, by provider, with latency and
+    guardrail-rejection counts — the "minimize LLM load" design goal made
+    queryable instead of only log-greppable. Backed by v_chat_llm_usage
+    (db/init/02_dashboard_summary_views.sql), same read-only agent_ro role
+    as /history above."""
+    with get_agent_cursor() as cur:
+        cur.execute("SELECT * FROM v_chat_llm_usage;")
+        rows = cur.fetchall()
+    return clean_rows(rows)

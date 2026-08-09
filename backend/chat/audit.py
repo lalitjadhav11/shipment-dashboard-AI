@@ -19,8 +19,9 @@ APP_DATABASE_URL = os.environ.get(
 _INSERT_SQL = """
     INSERT INTO shipment_chat_log
         (tracking_id, customer_id, user_query, ai_response,
-         context_snapshot, confidence_score)
-    VALUES (%s, %s, %s, %s, %s, %s)
+         context_snapshot, confidence_score,
+         source, llm_provider, llm_model, guardrail_status, latency_ms)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -32,6 +33,11 @@ def log_chat_interaction(
     ai_response: str,
     context_snapshot: dict,
     confidence_score: float | None,
+    source: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    guardrail_status: str | None = None,
+    latency_ms: float | None = None,
 ) -> None:
     # tracking_id here is the raw value Stage 2 extracted from free text —
     # it was NEVER confirmed to exist in `shipments` (that's exactly what a
@@ -45,7 +51,8 @@ def log_chat_interaction(
     conn = psycopg2.connect(APP_DATABASE_URL)
     try:
         params = (tracking_id, customer_id, user_query, ai_response,
-                  Json(context_snapshot), confidence_score)
+                  Json(context_snapshot), confidence_score,
+                  source, llm_provider, llm_model, guardrail_status, latency_ms)
         try:
             with conn.cursor() as cur:
                 cur.execute(_INSERT_SQL, params)

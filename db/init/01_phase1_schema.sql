@@ -171,6 +171,16 @@ CREATE TABLE shipment_chat_log (
   ai_response       TEXT NOT NULL,
   context_snapshot  JSONB,
   confidence_score  NUMERIC(5,4),
+  -- Ops/cost observability (added post-Phase-1-launch — see
+  -- AGENTIC_RAG_ARCHITECTURE.md's "minimize LLM load" design goal, made
+  -- measurable instead of only log-greppable). All nullable: a pure decline
+  -- (multi-tracking-id/multi-org-name guard, no template or LLM match) never
+  -- generates SQL, so source/guardrail_status legitimately stay NULL.
+  source            VARCHAR(20),   -- 'template' | 'llm' | NULL (declined before any SQL existed)
+  llm_provider      VARCHAR(20),   -- 'anthropic' | 'gemini' | 'ollama' | NULL (source='template' too)
+  llm_model         VARCHAR(80),   -- NULL unless source='llm'
+  guardrail_status  VARCHAR(20),   -- 'accepted' | 'rejected' | NULL (NULL = guardrail never ran)
+  latency_ms        NUMERIC(10,1), -- end-to-end pipeline wall-clock time
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
