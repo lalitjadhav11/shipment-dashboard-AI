@@ -5,6 +5,8 @@ instant). Each test resets llm_client's module-level circuit state first,
 since it's process-global by design (shared across every call_tool()
 invocation, the same way a real circuit breaker would be).
 """
+import threading
+
 import pytest
 
 from chat import llm_client
@@ -101,3 +103,29 @@ def test_different_providers_have_independent_circuits(monkeypatch):
     monkeypatch.setattr(llm_client, "PROVIDER", "gemini")
     result = llm_client.call_tool(system_prompt="s", user_message="u", tool_name="t", tool_schema={})
     assert result == {"ok": True}  # gemini's circuit is unaffected by anthropic's failure
+
+
+def test_concurrent_failures_are_not_undercounted(monkeypatch):
+    # Regression for a race found while auditing: FastAPI runs sync route
+    # handlers (chat(), plus main.py's ai-summary/ask endpoints) in a worker
+    # thread pool, so concurrent requests hitting the same provider genuinely
+    # call _record_failure() from different threads at once. Without
+    # _circuit_lock, "consecutive_failures += 1" (read-modify-write, not
+    # atomic) can lose increments under real concurrency. High iteration
+    # count + a barrier-style start (all threads launched before any join)
+    # maximizes the chance of exposing the race if the lock were removed.
+    monkeypatch.setattr(llm_client, "CIRCUIT_FAILURE_THRESHOLD", 10**9)  # never opens mid-test
+    n_threads = 20
+    calls_per_thread = 50
+
+    def hammer():
+        for _ in range(calls_per_thread):
+            llm_client._record_failure("anthropic")
+
+    threads = [threading.Thread(target=hammer) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert llm_client._circuit_state["anthropic"]["consecutive_failures"] == n_threads * calls_per_thread

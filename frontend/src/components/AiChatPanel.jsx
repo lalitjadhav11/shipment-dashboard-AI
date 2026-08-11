@@ -5,11 +5,19 @@ import { SparkleIcon } from "./icons.jsx";
 // Self-contained: owns the composer input AND the conversation history, so
 // the "AI Shipment Assistant" card only exists once there's something to
 // show — before the first question, this renders just the composer row.
+// One conversation = one session_id (Phase 3 session memory, see
+// backend/chat/session.py) — a follow-up like "what about it" can only
+// resolve against turns the backend has seen under the SAME id.
+function newSessionId() {
+  return crypto.randomUUID();
+}
+
 export default function AiChatPanel() {
   const [input, setInput] = useState("");
   const [turns, setTurns] = useState([]); // [{ id, query, loading, answer, error }]
   const abortRef = useRef(null);
   const nextIdRef = useRef(0);
+  const sessionIdRef = useRef(newSessionId());
 
   const busy = turns.some((t) => t.loading);
   const hasConversation = turns.length > 0;
@@ -25,7 +33,7 @@ export default function AiChatPanel() {
     const id = ++nextIdRef.current;
     setTurns((prev) => [...prev, { id, query, loading: true, answer: null, error: null }]);
 
-    askAgent(query, { signal: controller.signal })
+    askAgent(query, { signal: controller.signal, sessionId: sessionIdRef.current })
       .then((detail) => {
         if (controller.signal.aborted) return;
         setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, loading: false, answer: detail } : t)));
@@ -47,6 +55,7 @@ export default function AiChatPanel() {
   function clearChat() {
     abortRef.current?.abort();
     setTurns([]);
+    sessionIdRef.current = newSessionId(); // fresh conversation, fresh session
   }
 
   return (

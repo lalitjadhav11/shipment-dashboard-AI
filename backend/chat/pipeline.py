@@ -23,6 +23,7 @@ import time
 from . import intent as intent_stage
 from . import entities as entity_stage
 from . import schema_scope
+from . import session as session_stage
 from . import sql_templates
 from . import sql_llm
 from . import guardrails
@@ -89,27 +90,136 @@ def _is_minimal_query(query: str, tracking_ids: list) -> bool:
     return len(stripped.split()) <= MINIMAL_QUERY_MAX_WORDS
 
 
-def _multi_id_answer(tracking_ids: list) -> dict:
-    ids_str = " and ".join(tracking_ids) if len(tracking_ids) == 2 else ", ".join(tracking_ids)
+def _fmt_loc_or_date(row: dict) -> str:
+    if row.get("delivery_date"):
+        return f"delivered {row['delivery_date']}"
+    return f"ETA {row.get('estimated_delivery') or 'unknown'}"
+
+
+def _compare_shipments_answer(rows: list, tracking_ids: list) -> dict:
+    """Deterministic (zero-LLM) side-by-side comparison — the answer for a
+    plain 'compare X and Y' / 'show me both' question. Causal comparisons
+    ('which is more delayed and WHY') are routed to Stage 7 v1 synthesis
+    instead by _compare_shipments() below, since explaining a difference
+    needs real reasoning this fixed formatter can't produce — this only
+    ever has to list facts, not explain them."""
+    found_ids = {r["tracking_id"] for r in rows}
+    missing_ids = [tid for tid in tracking_ids if tid not in found_ids]
+
+    if not rows:
+        return {
+            "answer": f"I couldn't find any shipments matching {', '.join(tracking_ids)}.",
+            "confidence_score": 0.3,
+            "supporting_data": [],
+        }
+
+    lines = []
+    for row in rows:
+        delay_note = (
+            f", delayed ({row['reason_for_delay']})"
+            if row.get("reason_for_delay", "NONE") != "NONE" else ""
+        )
+        lines.append(
+            f"- {row['tracking_id']}: {row['current_status']}{delay_note}, "
+            f"{_fmt_loc_or_date(row)}, {row.get('open_issue_count', 0)} open issue(s)"
+        )
+
+    answer = "Here's a comparison:\n" + "\n".join(lines)
+    if missing_ids:
+        answer += f"\n\n(Couldn't find: {', '.join(missing_ids)})"
+
     return {
-        "answer": (
-            f"I can look up one shipment at a time right now — you mentioned {ids_str}. "
-            "Which one would you like details on? (Comparing multiple shipments in a "
-            "single answer isn't supported yet.)"
-        ),
-        "confidence_score": 0.0,
-        "supporting_data": {"tracking_ids_found": tracking_ids},
+        "answer": answer,
+        "confidence_score": 1.0 if not missing_ids else 0.7,
+        "supporting_data": rows,
     }
 
 
+_COMPARE_SQL = """
+    SELECT tracking_id, current_status, reason_for_delay, delay_comments,
+           estimated_delivery, delivery_date, open_issue_count, is_international,
+           customs_status
+    FROM v_shipment_journey_summary
+    WHERE tracking_id = ANY(%(tracking_ids)s)
+"""
+_COMPARE_ENTITY_KEYS = ["v_shipment_journey_summary"]
+
+
+def _compare_shipments(query: str, extracted, elapsed_ms, session_id):
+    """Multi-shipment comparison — closes the gap flagged as still-open in
+    AGENTIC_RAG_ARCHITECTURE.md §9 ("closing it means teaching the multi-ID
+    guard to route into cross-result synthesis instead of always
+    declining"). The SQL is always hand-built here (tracking_id = ANY(...))
+    — never LLM-drafted, since the shape is fully known and deterministic —
+    but it still passes through Stage 5's guardrail like every other query
+    in this system, no exceptions (defense in depth from day one, regardless
+    of source). Only the ANSWER differs by question type:
+      - a plain "compare X and Y" gets a free, instant side-by-side (no LLM)
+      - a causal comparison ("which is more delayed and WHY") routes through
+        Stage 7 v1 synthesis instead, reusing the exact is_causal_query
+        signal already used for the single-shipment causal gate — same
+        family of fix, same reasoning: a fixed formatter can list facts but
+        can't explain a difference.
+    `source`/`llm_provider`/`llm_model` for the audit row are decided by
+    which branch actually ran, NOT by how the SQL was generated (it's always
+    "template"-style here) — this is what v_chat_llm_usage's cost signal
+    actually needs to know: did this interaction spend a real LLM call.
+    """
+    try:
+        validated_sql = guardrails.validate_sql(_COMPARE_SQL, _COMPARE_ENTITY_KEYS)
+    except guardrails.GuardrailError as exc:
+        yield {"stage": "sql_rejected", "detail": {"reason": str(exc)}}
+        yield from _finish(query, extracted, "compare_shipments", REJECTED_ANSWER, [],
+                           elapsed_ms=elapsed_ms(), session_id=session_id)
+        return
+
+    params = {"tracking_ids": extracted.tracking_ids}
+    yield {"stage": "sql_generated", "detail": {
+        "sql": validated_sql, "params": params, "source": "template",
+    }}
+    yield {"stage": "sql_validated", "detail": {"status": "accepted"}}
+    yield {"stage": "executing", "detail": {}}
+
+    try:
+        result = executor.execute_query(validated_sql, params)
+    except executor.ExecutionError as exc:
+        yield {"stage": "execution_failed", "detail": {"reason": str(exc)}}
+        yield from _finish(query, extracted, "compare_shipments", EXECUTION_FAILED_ANSWER, [],
+                           source="template", guardrail_status="accepted", elapsed_ms=elapsed_ms(),
+                           session_id=session_id)
+        return
+    yield {"stage": "rows_returned", "detail": {
+        "count": result.row_count, "elapsed_ms": result.elapsed_ms,
+    }}
+
+    if schema_scope.is_causal_query(query):
+        yield {"stage": "causal_comparison_needs_llm", "detail": {
+            "reason": "comparison question asks 'why' — routing to Stage 7 v1 synthesis for "
+                      "real cross-shipment reasoning instead of a plain side-by-side listing",
+        }}
+        answer = synthesize.synthesize(query, result.rows, sql=validated_sql, params=params)
+        llm_provider, llm_model = llm_client.active_model_info()
+        yield from _finish(query, extracted, "compare_shipments", answer.model_dump(), result.rows,
+                           source="llm", llm_provider=llm_provider, llm_model=llm_model,
+                           guardrail_status="accepted", elapsed_ms=elapsed_ms(), session_id=session_id)
+    else:
+        answer = _compare_shipments_answer(result.rows, extracted.tracking_ids)
+        yield from _finish(query, extracted, "compare_shipments", answer, result.rows,
+                           source="template", guardrail_status="accepted", elapsed_ms=elapsed_ms(),
+                           session_id=session_id)
+
+
 def _multi_org_answer(org_names: list) -> dict:
-    # Mirrors _multi_id_answer above — same failure shape (a query naming
-    # more than one real entity, where entities.py's fuzzy matcher only
-    # returns/orders ALL matches, and answering about just the first would
-    # be misleading), same fix: decline and ask which one, instead of
-    # silently picking org_names[0]. Discovered via CHAT_TEST_QUERIES.md
-    # §6's "compare Acme Corp and Globex" example, which turned out NOT to
-    # be a safely-declined non-goal before this guard existed.
+    # Mirrors the (now-closed) multi-tracking-id decline's original shape —
+    # same failure class (a query naming more than one real entity, where
+    # entities.py's fuzzy matcher only returns/orders ALL matches, and
+    # answering about just the first would be misleading), same fix: decline
+    # and ask which one, instead of silently picking org_names[0]. Discovered
+    # via CHAT_TEST_QUERIES.md §6's "compare Acme Corp and Globex" example,
+    # which turned out NOT to be a safely-declined non-goal before this guard
+    # existed. Unlike tracking_id, this doesn't (yet) route into a real
+    # comparison — comparing customer portfolios is a different, bigger
+    # feature than comparing two shipments' status fields side by side.
     names_str = " and ".join(org_names) if len(org_names) == 2 else ", ".join(org_names)
     return {
         "answer": (
@@ -134,12 +244,16 @@ def _classify_and_extract(query: str):
 def _finish(
     query: str, extracted, intent_name, answer_payload: dict, context_rows,
     *, source=None, llm_provider=None, llm_model=None, guardrail_status=None, elapsed_ms=None,
+    session_id=None,
 ):
     # Audit write happens BEFORE the final yield, not after, so it still
     # runs even if the caller stops iterating right after "answer_ready".
     # source/guardrail_status/etc. default to None for the decline paths
-    # (multi-id/multi-org guard, no_intent_match) that never generated SQL
-    # at all — see shipment_chat_log's column comments in 01_phase1_schema.sql.
+    # (multi-org guard, no_intent_match) that never generated SQL at all —
+    # see shipment_chat_log's column comments in 01_phase1_schema.sql.
+    # session_id is persisted regardless of outcome (even a decline) so a
+    # NEXT turn in the same session has something to look up — see
+    # session.py's get_last_tracking_id().
     log_chat_interaction(
         tracking_id=extracted.tracking_id,
         customer_id=None,  # no auth/session model in Phase 1
@@ -152,18 +266,44 @@ def _finish(
         llm_model=llm_model,
         guardrail_status=guardrail_status,
         latency_ms=elapsed_ms,
+        session_id=session_id,
     )
     yield {"stage": "answer_ready", "detail": answer_payload}
 
 
-def run_pipeline(query: str):
+def run_pipeline(query: str, session_id: str | None = None):
     start = time.monotonic()
     elapsed_ms = lambda: round((time.monotonic() - start) * 1000, 1)  # noqa: E731
 
+    # nlu_ms/scoping_ms (below) are Phase 4's monitoring half — see
+    # AGENTIC_RAG_ARCHITECTURE.md §24: no vector-index backend swap is
+    # justified yet at today's scale (28 templates / 16 entities, ~10-25ms
+    # combined), but the trigger for revisiting that decision should be a
+    # measured trend over real traffic, not another one-off manual check.
+    # Only in the verbose/OPS trace, not persisted — this is an ops-debugging
+    # signal, not a per-interaction fact worth a shipment_chat_log column.
+    _t0 = time.monotonic()
     intent_result, extracted = _classify_and_extract(query)
+    nlu_ms = round((time.monotonic() - _t0) * 1000, 2)
+
+    # Phase 3 session memory (chat/session.py) — deliberately narrow: only
+    # ever carries forward a tracking_id, and only for a short, entity-less,
+    # pronoun-shaped follow-up ("what about it") with no fleet-wide language.
+    # A confidently WRONG carried-forward entity is worse than no session
+    # memory at all, so this stays conservative rather than trying to catch
+    # every possible follow-up phrasing — see session.py's module docstring.
+    session_context_used = False
+    if session_id and session_stage.wants_session_context(query, extracted):
+        inherited_tracking_id = session_stage.get_last_tracking_id(session_id)
+        if inherited_tracking_id:
+            extracted.tracking_id = inherited_tracking_id
+            extracted.tracking_ids = [inherited_tracking_id]
+            session_context_used = True
+
     yield {"stage": "intent_classified", "detail": {
         "intent": intent_result.intent,
         "confidence": round(intent_result.confidence, 3),
+        "nlu_ms": nlu_ms,
     }}
     yield {"stage": "entities_extracted", "detail": {
         "tracking_id": extracted.tracking_id,
@@ -171,19 +311,22 @@ def run_pipeline(query: str):
         "enum_matches": extracted.enum_matches,
         "org_name": extracted.org_name,
         "dates": extracted.dates,
+        "session_context_used": session_context_used,
     }}
 
     if len(extracted.tracking_ids) > 1:
-        # No v0 template can compare/combine multiple shipments in one answer —
-        # answering about only the first (which fill_template would silently do)
-        # is a worse failure than declining, so this is checked before routing.
+        # Multi-shipment comparison (AGENTIC_RAG_ARCHITECTURE.md §9's
+        # originally-flagged gap, closed) — answering about only the first
+        # (which fill_template would silently do) is still a worse failure
+        # than this, so it's checked before normal routing; the difference
+        # from the original design is what happens next isn't a decline
+        # anymore, see _compare_shipments().
         yield {"stage": "multiple_tracking_ids_detected", "detail": {
-            "reason": "no v0 template supports comparing multiple shipments; "
-                      "answering about only the first would be misleading",
+            "reason": "comparing shipments via tracking_id = ANY(...) instead of answering "
+                      "about only the first or declining outright",
             "tracking_ids": extracted.tracking_ids,
         }}
-        yield from _finish(query, extracted, None, _multi_id_answer(extracted.tracking_ids), [],
-                           elapsed_ms=elapsed_ms())
+        yield from _compare_shipments(query, extracted, elapsed_ms, session_id)
         return
 
     if len(extracted.org_names) > 1:
@@ -196,14 +339,17 @@ def run_pipeline(query: str):
             "org_names": extracted.org_names,
         }}
         yield from _finish(query, extracted, None, _multi_org_answer(extracted.org_names), [],
-                           elapsed_ms=elapsed_ms())
+                           elapsed_ms=elapsed_ms(), session_id=session_id)
         return
 
+    _t0 = time.monotonic()
     scoped = schema_scope.scope_schema(query, extracted)
+    scoping_ms = round((time.monotonic() - _t0) * 1000, 2)
     yield {"stage": "schema_scoped", "detail": {
         "entities": scoped.entities,
         "scores": {k: round(v, 3) for k, v in scoped.scores.items()},
         "forced_entities": scoped.forced_entities,
+        "scoping_ms": scoping_ms,
     }}
 
     resolved_intent = intent_result.intent
@@ -361,7 +507,7 @@ def run_pipeline(query: str):
                           "couldn't draft a usable query",
             }}
             yield from _finish(query, extracted, resolved_intent, CLARIFYING_ANSWER, [],
-                               elapsed_ms=elapsed_ms())
+                               elapsed_ms=elapsed_ms(), session_id=session_id)
             return
 
     yield {"stage": "sql_generated", "detail": {
@@ -423,7 +569,7 @@ def run_pipeline(query: str):
         yield {"stage": "sql_rejected", "detail": {"reason": str(guardrail_error)}}
         yield from _finish(query, extracted, resolved_intent, REJECTED_ANSWER, [],
                            source=filled.source, llm_provider=llm_provider, llm_model=llm_model,
-                           guardrail_status="rejected", elapsed_ms=elapsed_ms())
+                           guardrail_status="rejected", elapsed_ms=elapsed_ms(), session_id=session_id)
         return
 
     yield {"stage": "sql_validated", "detail": {"status": "accepted"}}
@@ -438,7 +584,7 @@ def run_pipeline(query: str):
         yield {"stage": "execution_failed", "detail": {"reason": str(exc)}}
         yield from _finish(query, extracted, resolved_intent, EXECUTION_FAILED_ANSWER, [],
                            source=filled.source, llm_provider=llm_provider, llm_model=llm_model,
-                           guardrail_status="accepted", elapsed_ms=elapsed_ms())
+                           guardrail_status="accepted", elapsed_ms=elapsed_ms(), session_id=session_id)
         return
     yield {"stage": "rows_returned", "detail": {
         "count": result.row_count, "elapsed_ms": result.elapsed_ms,
@@ -456,4 +602,4 @@ def run_pipeline(query: str):
     audit_intent = resolved_intent or "llm_drafted"
     yield from _finish(query, extracted, audit_intent, answer.model_dump(), result.rows,
                        source=filled.source, llm_provider=llm_provider, llm_model=llm_model,
-                       guardrail_status="accepted", elapsed_ms=elapsed_ms())
+                       guardrail_status="accepted", elapsed_ms=elapsed_ms(), session_id=session_id)

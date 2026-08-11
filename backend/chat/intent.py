@@ -43,15 +43,10 @@ def rank_intents(query: str) -> list:
     if not intent_bank:
         return []
 
-    q_vec = schema_loader.embed(query)
-    ranked = sorted(
-        (
-            RankedIntent(entry["intent"], entry["example_nl"], schema_loader.cosine(q_vec, entry["vector"]))
-            for entry in intent_bank
-        ),
-        key=lambda r: -r.score,
-    )
-    return ranked
+    examples_by_intent = {entry["intent"]: entry["example_nl"] for entry in intent_bank}
+    candidates = {entry["intent"]: entry["vector"] for entry in intent_bank}
+    ranked = schema_loader.rank_by_similarity(query, candidates)
+    return [RankedIntent(name, examples_by_intent[name], score) for name, score in ranked]
 
 
 def classify_intent(query: str) -> IntentResult:

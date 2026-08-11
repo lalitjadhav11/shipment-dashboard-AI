@@ -1569,3 +1569,146 @@ Different failure layer than every other section in this document so far (§15-�
 Stage 1/3/4b routing or scoping gaps) — a reminder that "the answer is wrong" doesn't always mean
 the routing layer is where to look first; here the fix was two stages earlier, in the regex that
 was supposed to hand routing a tracking_id in the first place.
+
+## 22. "Give me the status history" — a fillable template answered the wrong question shape (backfill)
+
+Live query: *"give me the status history for 800000000073"* matched `where_is_my_package`
+(tracking_id present, fills trivially) and answered *"currently OUT_FOR_DELIVERY, last seen at
+Melbourne"* — true, but not a history. That formatter only ever reads the LAST hop of
+`journey_timeline`, even though the underlying SQL already selects the whole array. Same shape as
+§15/§18's "a successfully-filled template is not necessarily the right one," a third instance for
+a third signal: `schema_scope.wants_history()` (`history`, `timeline`, `journey`, `previous
+stage(s)`, `tracking events`, …) plus a new `TemplateSpec.shows_full_history` flag (`False` for
+every existing template — none of them narrate the full journey, only the current/last stage).
+`pipeline.py`'s post-Stage-4a gate discards a match when the query wants history and the resolved
+template doesn't provide it, routing to Stage 4b instead, which narrates the real
+`journey_timeline` via `synthesize()`. Same non-weakening reasoning as the causal/list/grouping
+gates alongside it: nothing here changes what Stage 4a can *do*, only whether a technically-filled
+answer is allowed to stand in for one that actually addresses the question.
+
+*(Code referenced this section by number since the fix shipped — this entry backfills the write-up
+that was never committed alongside it.)*
+
+## 23. Phase 3 — closing the multi-shipment comparison gap, and session-scoped follow-ups
+
+Two features, both explicitly named as future work earlier in this document (§9's "genuinely still
+open" list: "true multi-shipment comparison... still not handled").
+
+**Multi-shipment comparison.** The multi-tracking-id guard (§9) used to intercept 2+ tracking IDs
+and decline unconditionally — a deliberate, honest stopgap at the time, but a dead end. It's now a
+real comparison: `pipeline.py`'s `_compare_shipments()` always hand-builds
+`SELECT ... FROM v_shipment_journey_summary WHERE tracking_id = ANY(%(tracking_ids)s)` — never
+LLM-drafted, since the shape is fully known — but the query still passes through Stage 5's
+guardrail like everything else in this system, no exceptions. Only the *answer* branches by
+question type, reusing `is_causal_query()` (the same detector §15/§15.1 built): a plain "compare X
+and Y" gets a free, instant side-by-side listing (zero LLM cost); "which is more delayed and WHY"
+routes to Stage 7 v1 synthesis instead, since explaining a difference needs real reasoning a fixed
+formatter can't produce. Live-verified both branches against real data — the causal branch
+correctly reasoned that a `CUSTOMS_HOLD` shipment was "more delayed" than one still `IN_TRANSIT`
+past its own ETA, correctly distinguishing "stuck" from "overdue but still moving" — and verified
+the missing-shipment case degrades honestly (partial data → confidence 0.4, explicit "cannot
+determine... without information on both" rather than guessing).
+
+`source`/`llm_provider`/`llm_model` for this path are set by which branch actually ran (did this
+interaction spend a real LLM call), not by how the SQL was produced (always hand-built here) — the
+first time those two things have needed to be decoupled, since every other path in this system had
+them 1:1 coupled by construction.
+
+**Session-scoped follow-ups.** No auth/session system exists yet, so this is deliberately
+lightweight: an optional client-generated `session_id` (a browser-side UUID, `AiChatPanel.jsx`,
+one per conversation) threaded through `POST /api/chat`, persisted as a new nullable
+`shipment_chat_log.session_id` column — reusing the existing audit trail as the backing store
+rather than introducing a new cache/session layer. `chat/session.py`'s `wants_session_context()`
+is deliberately narrow, for the same reason every entity-forcing signal in this document has
+stayed narrow: a confidently WRONG carried-forward tracking_id is worse than no session memory at
+all. It only fires for a short (≤8 words), pronoun-shaped ("it"/"that"/"this"), otherwise
+entity-less query with no fleet-wide language ("shipments"/"orders"/"customers"/…) — e.g. "what
+about it" or "why is it delayed" right after a shipment-specific turn. When it fires,
+`get_last_tracking_id()` looks up the most recent tracking_id logged under that `session_id` and
+injects it into `extracted.tracking_id` *before* any other routing logic runs — so it flows through
+the exact same override/default/template/causal-gate machinery as if the user had typed it
+themselves, no special-casing needed downstream.
+
+Live-verified end to end: *"where is 100000000034"* then, same session, *"why is it delayed"* →
+correctly inherited the tracking_id (`session_context_used: true` in the trace) and resolved
+directly to `why_is_it_late` — zero LLM cost, correct customs-delay answer, without the user
+repeating the tracking number. Verified the dangerous direction just as carefully: the same
+follow-up phrasing in a *fresh* session (nothing to inherit) correctly asked for clarification
+instead of guessing, and a genuinely fleet-wide question ("what's our overall on-time percentage")
+asked *in the same session* right after a shipment-specific turn correctly did **not** inherit
+anything — confirmed live via `session_context_used: false` in both cases.
+
+## 24. Phase 4 — measured before touching the vector-index backend, and deliberately left alone
+
+§8's "Scalability path" already named the eventual move: "if Phase 2+ grows this materially, swap
+`schema_scope.py`'s backing store for `pgvector` or FAISS... without touching Stages 1/2/4-7." The
+question this section answers is *whether that's needed yet* — measured, not guessed, the same
+standard every other section in this document holds itself to.
+
+**Measured 2026-08-09, twice, because the first measurement was misleading.** First pass: timing
+`intent.classify_intent()`/`schema_scope.scope_schema()` directly and in isolation gave 10-25ms
+combined across three representative queries — 28 templates in the intent bank, 16 schema
+entities/views scored. But that isolated number doesn't reflect what a real request actually
+pays: `pipeline.py` runs Stage 1 concurrently with Stage 2 (entity extraction) inside a
+`ThreadPoolExecutor` created fresh per request, and once the new `nlu_ms` trace field (added below)
+was actually exercised over live HTTP requests, it read 45-150ms — 2-6x higher, and visibly
+variable run to run. Isolating further: `intent.classify_intent()` alone (~10-15ms),
+`entities.extract_entities()` alone (~5-7ms), and `schema_scope.scope_schema()` alone (~9-10ms) are
+each individually cheap and roughly matched the first pass — but running Stage 1+2 back-to-back,
+concurrently *or* sequentially, consistently cost ~45-50ms in a tight loop, well above the sum of
+the parts measured alone. Not chased further here (see below for why) — flagging the discrepancy
+plainly rather than reporting the flattering first number, the same "don't report a number you
+haven't actually verified end-to-end" standard as everywhere else in this document (§13, §19).
+
+Whichever number is the "real" one, the conclusion this section exists to reach doesn't change:
+even 150ms is roughly an order of magnitude below Stage 6 (DB execution) and 1-2 orders of
+magnitude below Stage 4b/7v1 (a real LLM round-trip, 200ms-6s+) — nowhere close to being the
+pipeline's bottleneck, and §8's own stated comfort zone ("fine for ~15-50 entities/views") holds
+regardless of which measurement is used. The *cosine-ranking arithmetic itself* — the thing a
+vector-index backend swap would actually address — is confirmed cheap (~9-15ms) under every
+measurement; the extra, more variable cost sits somewhere in per-request concurrency overhead
+(thread-pool creation, GIL contention, or process-level noise in a shared environment), which is a
+different, unrelated question from "does the candidate set need a heavier ranking backend." Worth
+a closer look on its own terms eventually (a persistent thread pool, or reconsidering whether
+concurrency is even worth it here given how cheap both tasks already are individually) — but
+that's a general pipeline-latency question, not a Phase 4 vector-scaling one, so it's noted here
+and deliberately not chased as part of this section.
+
+**Decision: do not deploy pgvector/FAISS/a cross-encoder reranker now.** Doing so would add a new
+dependency, a new failure mode, and real code to maintain, in exchange for zero measurable benefit
+today — precisely the premature-optimization trade this project's own design principles (and
+every "don't build what isn't needed yet" instinct behind the v0-before-v1 rollout in §2) argue
+against. Building it speculatively, with no real traffic pattern to tune it against, would also
+mean tuning it against guesses rather than evidence — the same mistake a `top_k` or confidence
+threshold picked without live verification has caused repeatedly elsewhere in this document (§9,
+§12, §13).
+
+**What "proper strategy" means when the answer is "not yet," concretely:**
+1. **The swap seam, extracted now, cheap regardless of when (or whether) it's ever exercised.**
+   `intent.rank_intents()` and `schema_scope.scope_schema()` had each independently implemented
+   the identical embed-then-sort-by-cosine loop — genuine, pre-existing duplication, not
+   speculative. Consolidated into `schema_loader.rank_by_similarity(query, candidates: dict) ->
+   list[(name, score)]`, used by both. If a heavier backend is ever justified, this is the one
+   function that changes; neither caller needs to. Verified behavior-preserving: the full 172-test
+   suite (heavy on exact intent/scoping assertions) passed unchanged before and after the
+   refactor — this was a pure extraction, not a behavior change.
+2. **The missing instrumentation, added.** Before this section, "is Stage 1+3 latency a problem"
+   could only be answered by a one-off manual measurement (as above) — there was no ongoing signal.
+   `pipeline.py`'s `intent_classified`/`schema_scoped` trace events now carry `nlu_ms`/`scoping_ms`
+   respectively. Deliberately trace-only (verbose/OPS-gated, like every other trace event — see
+   §5), not persisted to `shipment_chat_log`: this is an ops-debugging signal about the pipeline's
+   internals, not a per-interaction fact worth a permanent column the way `source`/`latency_ms`
+   (Phase 1) are.
+3. **A concrete, numeric trigger for revisiting, written down instead of left to vibes.** Revisit
+   this decision when *any* of: template count exceeds ~50, schema entities/views exceed ~50, or
+   `scoping_ms` alone (not `nlu_ms` — that field is contaminated by the unrelated concurrency
+   overhead noted above, so it's not a clean signal for *this specific* decision) sustained (p95,
+   over real traffic) exceeds ~50ms, roughly 5x today's measured range for the ranking arithmetic
+   itself. None of these numbers is precise or magic; the point is that a future session can check
+   real numbers against a real threshold instead of re-deriving "is this actually a problem yet"
+   from scratch, or worse, building the heavier backend reflexively just because a roadmap once
+   listed it as "Phase 4."
+
+Same lesson as the rest of this document, aimed at a different kind of mistake: verifying *before*
+building is exactly as important as verifying *after* — the fix for a roadmap item that turns out
+to be premature is measuring that plainly, not implementing it anyway because it was on the list.

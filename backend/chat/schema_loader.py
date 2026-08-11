@@ -47,6 +47,27 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def rank_by_similarity(query: str, candidates: dict) -> list:
+    """Embeds `query` once and ranks every (name, vector) pair in
+    `candidates` by cosine similarity, best first — [(name, score), ...].
+
+    Shared by intent.py's intent-bank ranking (Stage 1) and schema_scope.py's
+    entity/view ranking (Stage 3) — both used to independently implement the
+    identical embed-then-sort-by-cosine loop. One definition here is also
+    the swap seam for a heavier backend (pgvector, FAISS, a cross-encoder
+    reranker) if the candidate count ever outgrows a flat in-memory scan:
+    that would mean changing this one function, not both callers. Measured
+    2026-08-09 at 28 templates / 16 schema entities/views: ~10-25ms combined
+    for both stages, nowhere near a bottleneck — see
+    AGENTIC_RAG_ARCHITECTURE.md §24 for why that swap isn't happening yet
+    and the concrete, numeric trigger for when to revisit."""
+    q_vec = embed(query)
+    return sorted(
+        ((name, cosine(q_vec, vec)) for name, vec in candidates.items()),
+        key=lambda pair: -pair[1],
+    )
+
+
 _COLUMN_NAME_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)")
 
 

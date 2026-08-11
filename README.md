@@ -165,7 +165,7 @@ stack to another machine.
 | GET    | `/health`               | Liveness + DB connectivity                |
 | GET    | `/api/summary`          | `v_dashboard_headline` — 10 KPIs          |
 | GET    | `/api/status-breakdown` | `v_status_breakdown`                      |
-| POST   | `/api/chat`              | AI Shipment Journey Summary chat — streams Server-Sent Events, one per pipeline stage, ending with `answer_ready`. Send `{"query": "..."}`. Falls back to Stage 4b (LLM) when no template matches, if `ANTHROPIC_API_KEY` is set — see status table above. |
+| POST   | `/api/chat`              | AI Shipment Journey Summary chat — streams Server-Sent Events, one per pipeline stage, ending with `answer_ready`. Send `{"query": "...", "session_id": "..."}` (`session_id` optional — enables follow-up context, see Phase 3 below). Falls back to Stage 4b (LLM) when no template matches, if `ANTHROPIC_API_KEY` is set — see status table above. |
 | GET    | `/api/chat/history`      | Read `shipment_chat_log` for QA (optional `?tracking_id=`) |
 | GET    | `/api/chat/llm-usage`    | `v_chat_llm_usage` — template-vs-LLM traffic split by provider, with avg latency and guardrail-rejection counts |
 
@@ -187,7 +187,7 @@ curl -N -X POST http://localhost:8000/api/chat \
 ## Chat pipeline regression suite
 
 `backend/tests/` is an executable version of `CHAT_TEST_QUERIES.md` — one intent-classification
-assertion per template, plus the documented routing edge cases (multi-tracking-ID decline, the
+assertion per template, plus the documented routing edge cases (multi-tracking-ID comparison, the
 bare-ID default, the fleet-intent override guard, the causal/aggregate "successfully-filled
 template isn't necessarily the right one" gates) and Stage 5 guardrail checks for every template.
 It runs offline — no live Postgres or LLM call — by pre-loading the embedding model once per
@@ -216,6 +216,41 @@ something only answerable by grepping container logs. `GET /api/chat/llm-usage`
 (`v_chat_llm_usage`) surfaces the aggregate: template-vs-LLM traffic split by provider, with avg
 latency and guardrail-rejection counts. Existing rows from before this change have these columns
 `NULL` — expected, not a data-quality bug.
+
+## Chat pipeline reasoning depth (Phase 3)
+
+Two additions closing gaps `AGENTIC_RAG_ARCHITECTURE.md` §9 explicitly flagged as still open:
+
+- **Multi-shipment comparison.** Mentioning 2+ tracking IDs no longer declines outright — it
+  always fetches all of them (`tracking_id = ANY(...)`, hand-built SQL, still guardrail-checked
+  like everything else) and answers with a free, instant side-by-side comparison for a plain
+  "compare X and Y," or routes to real LLM reasoning (Stage 7 v1) for a causal comparison ("which
+  is more delayed and why") — reusing the same `is_causal_query` signal the single-shipment causal
+  gate already uses. A shipment that can't be found is reported honestly, never silently dropped.
+- **Session-scoped follow-ups.** `POST /api/chat` accepts an optional `session_id` (the frontend
+  generates one UUID per conversation, see `AiChatPanel.jsx`) so a short, pronoun-shaped follow-up
+  ("what about it", "why is it delayed") can resolve without repeating the tracking number —
+  backed by a new nullable `shipment_chat_log.session_id` column (reusing the existing audit trail,
+  no new session store). Deliberately conservative: only carries a tracking_id forward for a
+  query with no entity of its own and no fleet-wide language, so a genuinely new, unrelated
+  question in the same session is never mistakenly scoped to the previous shipment.
+
+## Chat pipeline scaling decision (Phase 4)
+
+Measured before building anything: 28 templates, 16 schema entities/views. The cosine-ranking
+arithmetic itself is cheap (~9-15ms isolated) under every measurement — nowhere close to Stage 6
+(DB) or Stage 4b/7v1 (a real LLM call), 1-2 orders of magnitude apart. (A live end-to-end
+`nlu_ms` reading of 45-150ms surfaced *after* adding the trace field below — traced to per-request
+concurrency overhead in Stage 1+2's `ThreadPoolExecutor`, not the ranking arithmetic; noted, not
+chased, since it's a different question than this section is about — see `AGENTIC_RAG_ARCHITECTURE.md`
+§24 for the full measurement trail, including the correction.) **Decision: no pgvector/FAISS/
+reranker backend swap yet** — that would be premature optimization with no measured benefit. What
+shipped instead: `schema_loader.rank_by_similarity()`, a shared ranking function extracted from
+what `intent.py`/`schema_scope.py` each used to implement separately (a genuine dedup, and the seam
+a future swap would touch), plus `nlu_ms`/`scoping_ms` added to the verbose trace so latency is an
+ongoing measured signal instead of a one-off manual check. Concrete revisit trigger: >50 templates,
+>50 entities/views, or sustained p95 `scoping_ms` (the clean signal — `nlu_ms` is contaminated by
+the unrelated concurrency overhead) > ~50ms.
 
 ## Chat pipeline reliability (Phase 2)
 

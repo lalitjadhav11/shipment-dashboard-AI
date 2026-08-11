@@ -275,20 +275,13 @@ def scope_schema(query: str, extracted=None, top_k: int = DEFAULT_TOP_K) -> Scop
     state = schema_loader.get_state()
     schema_index = state["schema_index"]
 
-    q_vec = schema_loader.embed(query)
-    scored = sorted(
-        (
-            (name, schema_loader.cosine(q_vec, vec))
-            for name, vec in schema_index.items()
-            if name not in NEVER_SCOPE_ENTITIES
-        ),
-        key=lambda t: -t[1],
-    )
+    # NEVER_SCOPE_ENTITIES is filtered out of the candidate dict BEFORE
+    # ranking, not just the final return — this is what stops the
+    # RECORD_LEVEL/CAUSAL/HISTORY force-include loops below from ever being
+    # able to re-add a never-scope entity via `entity in scored_lookup`.
+    candidates = {name: vec for name, vec in schema_index.items() if name not in NEVER_SCOPE_ENTITIES}
+    scored = schema_loader.rank_by_similarity(query, candidates)
     scored_lookup = dict(scored)
-    # Filtered out of `scored`/`scored_lookup` above, not just the final
-    # return — this is what stops the RECORD_LEVEL/CAUSAL/HISTORY force-
-    # include loops below from ever being able to re-add a never-scope
-    # entity via `entity in scored_lookup`.
 
     ranked = [name for name, _ in scored[:top_k]]
     scores = {name: score for name, score in scored[:top_k]}

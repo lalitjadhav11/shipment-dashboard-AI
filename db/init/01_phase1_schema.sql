@@ -181,6 +181,13 @@ CREATE TABLE shipment_chat_log (
   llm_model         VARCHAR(80),   -- NULL unless source='llm'
   guardrail_status  VARCHAR(20),   -- 'accepted' | 'rejected' | NULL (NULL = guardrail never ran)
   latency_ms        NUMERIC(10,1), -- end-to-end pipeline wall-clock time
+  -- Session memory (Phase 3, see chat/session.py). Client-generated opaque
+  -- string (a browser-side UUID, but stored as VARCHAR — not a UUID column —
+  -- since there's no server-side session system to validate/issue it against
+  -- yet; matches this table's existing convention of VARCHAR for
+  -- externally-supplied IDs like tracking_id/order_id). NULL for any request
+  -- that didn't send one — session memory is opt-in, never required.
+  session_id        VARCHAR(64),
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -205,6 +212,7 @@ CREATE INDEX idx_shipment_issues_type_status ON shipment_issues (issue_type, sta
 
 CREATE INDEX idx_chat_log_tracking_id        ON shipment_chat_log (tracking_id);
 CREATE INDEX idx_chat_log_confidence         ON shipment_chat_log (confidence_score);
+CREATE INDEX idx_chat_log_session_id         ON shipment_chat_log (session_id, created_at DESC);
 
 -- -----------------------------------------------------------------------------
 -- TRIGGER: keep updated_at fresh on customers + shipments

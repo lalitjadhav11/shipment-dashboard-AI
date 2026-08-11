@@ -20,8 +20,9 @@ _INSERT_SQL = """
     INSERT INTO shipment_chat_log
         (tracking_id, customer_id, user_query, ai_response,
          context_snapshot, confidence_score,
-         source, llm_provider, llm_model, guardrail_status, latency_ms)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         source, llm_provider, llm_model, guardrail_status, latency_ms,
+         session_id)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -38,6 +39,7 @@ def log_chat_interaction(
     llm_model: str | None = None,
     guardrail_status: str | None = None,
     latency_ms: float | None = None,
+    session_id: str | None = None,
 ) -> None:
     # tracking_id here is the raw value Stage 2 extracted from free text —
     # it was NEVER confirmed to exist in `shipments` (that's exactly what a
@@ -52,15 +54,31 @@ def log_chat_interaction(
     try:
         params = (tracking_id, customer_id, user_query, ai_response,
                   Json(context_snapshot), confidence_score,
-                  source, llm_provider, llm_model, guardrail_status, latency_ms)
+                  source, llm_provider, llm_model, guardrail_status, latency_ms,
+                  session_id)
         try:
             with conn.cursor() as cur:
                 cur.execute(_INSERT_SQL, params)
             conn.commit()
-        except psycopg2.errors.ForeignKeyViolation:
+        except (psycopg2.errors.ForeignKeyViolation, psycopg2.errors.StringDataRightTruncation):
+            # Both are the same class of problem: a value that looked
+            # plausible from raw text/client input but Postgres correctly
+            # rejected — an unverified tracking_id/customer_id reference, or
+            # session_id exceeding its VARCHAR(64) column. The primary
+            # defense for the latter is router.py's Pydantic max_length on
+            # ChatRequest (a clean 422 before this ever runs); this is the
+            # backstop for any future caller that constructs the pipeline
+            # directly and skips that check — live-reproduced without it:
+            # an oversized session_id raised StringDataRightTruncation
+            # uncaught and crashed the entire SSE stream mid-response, same
+            # failure shape the ForeignKeyViolation retry already prevents
+            # for the other two columns. Nulling every unverified/external
+            # reference together (rather than diagnosing exactly which
+            # field caused which error) also correctly handles both
+            # failing in the same request.
             conn.rollback()
             with conn.cursor() as cur:
-                cur.execute(_INSERT_SQL, (None, None, *params[2:]))
+                cur.execute(_INSERT_SQL, (None, None, *params[2:-1], None))
             conn.commit()
     finally:
         conn.close()

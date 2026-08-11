@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-from chat import schema_loader, entities
+from chat import schema_loader, entities, pipeline
 
 FIXTURE_ORG_NAMES = [
     "Smith Ltd", "Walker PLC", "Brown and Sons", "Acme Corp",
@@ -61,6 +61,20 @@ def _no_live_llm_calls():
     import os
     for var in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "AGENT_LLM_PROVIDER"):
         os.environ.pop(var, None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_audit_writes(monkeypatch):
+    """_finish() (pipeline.py) writes to shipment_chat_log via the real app
+    DB role BEFORE yielding "answer_ready" — every test so far has avoided
+    this by using consume_until() with a stop_stage yielded earlier in the
+    trace, never actually reaching _finish(). That's a fragile invariant to
+    rely on implicitly (easy for a future test to violate by accident), and
+    comparison/session tests need to inspect the final answer_ready payload
+    directly. Mocking the write here makes "no real DB writes from this
+    suite" an explicit guarantee instead of a coincidence of which stop_stage
+    each test happened to pick."""
+    monkeypatch.setattr(pipeline, "log_chat_interaction", lambda **kwargs: None)
 
 
 @pytest.fixture(autouse=True)

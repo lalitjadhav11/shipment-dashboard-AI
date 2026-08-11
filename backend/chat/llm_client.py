@@ -41,6 +41,7 @@ twice in a row" — named at design time, never actually built until now):
 """
 import os
 import sys
+import threading
 import time
 
 PROVIDER = os.environ.get("AGENT_LLM_PROVIDER", "anthropic").lower()
@@ -67,6 +68,17 @@ CIRCUIT_COOLDOWN_SECONDS = float(os.environ.get("AGENT_LLM_CIRCUIT_COOLDOWN_SECO
 
 _client_state = {}
 _circuit_state = {}  # provider -> {"consecutive_failures": int, "opened_at": float | None}
+# FastAPI runs sync route handlers (chat(), the ai-summary/ask endpoints in
+# main.py) in a worker thread pool, so concurrent requests hitting the same
+# provider genuinely run call_tool() on different threads at once — this
+# module-level dict is shared, mutable state across them. Without a lock,
+# `state["consecutive_failures"] += 1` (read-modify-write, not atomic across
+# a GIL context switch) can lose increments under concurrent failures,
+# undercounting toward CIRCUIT_FAILURE_THRESHOLD. Low-impact on its own (the
+# circuit just opens a bit later than configured, never fails open into
+# something unsafe), but cheap enough to close properly rather than leave as
+# a known imprecision.
+_circuit_lock = threading.Lock()
 
 
 def _circuit_for(provider: str) -> dict:
@@ -79,25 +91,28 @@ def _circuit_is_open(provider: str) -> bool:
     failure or a success — it doesn't touch consecutive_failures/opened_at —
     so a burst of fast-fail calls while the circuit is open can't extend its
     own cooldown."""
-    state = _circuit_for(provider)
-    if state["opened_at"] is None:
-        return False
-    if time.monotonic() - state["opened_at"] >= CIRCUIT_COOLDOWN_SECONDS:
-        return False  # cooldown elapsed — let this call through as a half-open trial
-    return True
+    with _circuit_lock:
+        state = _circuit_for(provider)
+        if state["opened_at"] is None:
+            return False
+        if time.monotonic() - state["opened_at"] >= CIRCUIT_COOLDOWN_SECONDS:
+            return False  # cooldown elapsed — let this call through as a half-open trial
+        return True
 
 
 def _record_failure(provider: str) -> None:
-    state = _circuit_for(provider)
-    state["consecutive_failures"] += 1
-    if state["consecutive_failures"] >= CIRCUIT_FAILURE_THRESHOLD:
-        state["opened_at"] = time.monotonic()
+    with _circuit_lock:
+        state = _circuit_for(provider)
+        state["consecutive_failures"] += 1
+        if state["consecutive_failures"] >= CIRCUIT_FAILURE_THRESHOLD:
+            state["opened_at"] = time.monotonic()
 
 
 def _record_success(provider: str) -> None:
-    state = _circuit_for(provider)
-    state["consecutive_failures"] = 0
-    state["opened_at"] = None
+    with _circuit_lock:
+        state = _circuit_for(provider)
+        state["consecutive_failures"] = 0
+        state["opened_at"] = None
 
 
 # --- Anthropic -----------------------------------------------------------

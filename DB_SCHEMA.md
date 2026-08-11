@@ -171,6 +171,7 @@ it can insert its own back-dated, authoritative history instead).
 | `llm_model` | `VARCHAR(80)` | `NULL` unless `source='llm'` |
 | `guardrail_status` | `VARCHAR(20)` | `'accepted'` \| `'rejected'` \| `NULL` (`NULL` = guardrail never ran) |
 | `latency_ms` | `NUMERIC(10,1)` | end-to-end pipeline wall-clock time |
+| `session_id` | `VARCHAR(64)` | client-generated opaque ID (Phase 3 session memory, `chat/session.py`); `NULL` if the request didn't send one |
 | `created_at` | `TIMESTAMPTZ` | |
 
 ## Enum types
@@ -228,4 +229,4 @@ dashboard and the chat agent's 10 aggregate templates.
 | `shipments` | `customer_id`, `current_status`, `reason_for_delay`, `created_at`, `delivery_date`, `estimated_delivery`, `is_international`, `customs_status`, `delivery_type` |
 | `tracking_events` | `tracking_id`, `event_timestamp` |
 | `shipment_issues` | `tracking_id`, (`issue_type`, `status`) |
-| `shipment_chat_log` | `tracking_id`, `confidence_score` |
+| `shipment_chat_log` | `tracking_id`, `confidence_score`, (`session_id`, `created_at` desc) |

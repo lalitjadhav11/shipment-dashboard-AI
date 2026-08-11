@@ -91,7 +91,9 @@ def test_casual_open_issues_phrasing_falls_below_threshold():
 
 # --- Part 3: full-pipeline routing edge cases -------------------------------
 
-def test_multiple_tracking_ids_declines_without_guessing():
+def test_multiple_tracking_ids_are_detected_for_comparison():
+    # Detection only — see test_compare_shipments.py for what happens next
+    # (Phase 3: routes to a real comparison, not a decline anymore).
     events = consume_until(
         pipeline.run_pipeline("Compare 700000000001 and 100000000002"),
         "multiple_tracking_ids_detected",

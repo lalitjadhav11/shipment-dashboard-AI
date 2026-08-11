@@ -13,12 +13,17 @@ import { API_BASE } from "./api.js";
  * SUPPORT/OPS/ADMIN privilege (see backend/chat/router.py), and this is the
  * customer-facing dashboard, so only the final `answer_ready` event is ever
  * streamed back here anyway.
+ *
+ * `sessionId` (Phase 3 session memory, backend/chat/session.py) is optional
+ * — the caller owns generating/persisting it (see AiChatPanel.jsx), this
+ * just forwards whatever it's given. Omitting it behaves exactly as before
+ * session memory existed: no follow-up context available.
  */
-export async function askAgent(query, { signal } = {}) {
+export async function askAgent(query, { signal, sessionId } = {}) {
   const res = await fetch(`${API_BASE}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({ query, session_id: sessionId }),
     signal,
   });
   if (!res.ok || !res.body) {
