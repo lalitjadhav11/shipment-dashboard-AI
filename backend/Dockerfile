@@ -16,8 +16,10 @@ COPY requirements-dev.txt .
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
 COPY main.py .
+COPY conftest.py .
 COPY chat/ ./chat/
 COPY tests/ ./tests/
+COPY evals/ ./evals/
 COPY pytest.ini .
 
 EXPOSE 8000

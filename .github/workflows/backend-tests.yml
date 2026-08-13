@@ -1,0 +1,40 @@
+name: backend-tests
+
+# Runs backend/tests/ (routing/plumbing regression suite) and evals/ Phase A
+# (trajectory evals) together — pytest.ini's addopts already deselects
+# @pytest.mark.costly, so this workflow spends zero LLM cost and needs no
+# Postgres service container: schema_loader.warm_up() only needs the schema
+# JSON + the sentence-transformers model (downloaded from the Hub, cached
+# below), and conftest.py's autouse fixtures mock the one thing that would
+# otherwise touch a real DB (entities.py's org/city name cache).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache sentence-transformers model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-all-MiniLM-L6-v2
+
+      - name: Install dependencies
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests + Phase A evals
+        run: pytest -q

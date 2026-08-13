@@ -7,7 +7,7 @@ runs offline with no real LLM cost, and consume_until stops at
 from chat import pipeline
 from chat.sql_templates import FilledTemplate
 
-from tests.conftest import consume_until
+from conftest import consume_until
 
 
 def test_guardrail_rejection_retries_once_with_feedback_then_succeeds(monkeypatch):

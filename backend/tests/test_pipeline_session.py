@@ -5,7 +5,7 @@ rest of the suite.
 """
 from chat import pipeline
 
-from tests.conftest import consume_until
+from conftest import consume_until
 
 
 def test_followup_query_inherits_tracking_id_from_session(monkeypatch):

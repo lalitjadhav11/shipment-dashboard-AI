@@ -11,7 +11,7 @@ from chat import pipeline
 from chat.executor import ExecutionResult
 from chat.respond_template import ShipmentAnswer
 
-from tests.conftest import consume_until
+from conftest import consume_until
 
 TWO_SHIPMENT_ROWS = [
     {

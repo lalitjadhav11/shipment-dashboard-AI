@@ -24,7 +24,7 @@ import pytest
 from chat import intent as intent_stage
 from chat import pipeline
 
-from tests.conftest import consume_until
+from conftest import consume_until
 
 # --- Part 1: one canonical query per template, intent classification only --
 
