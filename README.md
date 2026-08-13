@@ -184,7 +184,7 @@ curl -N -X POST http://localhost:8000/api/chat \
   -H "Content-Type: application/json" -H "X-User-Role: OPS" \
   -d '{"query": "Why is my package <a real tracking_id> delayed?"}'
 ```
-## Chat pipeline regression suite
+## Chat pipeline regression suite + evals
 
 `backend/tests/` is an executable version of `CHAT_TEST_QUERIES.md` — one intent-classification
 assertion per template, plus the documented routing edge cases (multi-tracking-ID comparison, the
@@ -192,12 +192,23 @@ bare-ID default, the fleet-intent override guard, the causal/aggregate "successf
 template isn't necessarily the right one" gates) and Stage 5 guardrail checks for every template.
 It runs offline — no live Postgres or LLM call — by pre-loading the embedding model once per
 session and monkeypatching the org-name/city fuzzy-match caches with fixture data, so it finishes
-in a few seconds and is safe to run before every commit:
+in a few seconds and is safe to run before every commit. `backend/evals/` (see
+`AGENTIC_RAG_ARCHITECTURE.md` §25) is a separate, growing product-quality baseline rather than a
+per-bug regression test: Phase A (`@pytest.mark.eval`) is trace-based and just as free as `tests/`,
+runs by default alongside it; Phase B (`@pytest.mark.eval @pytest.mark.costly`) LLM-judges Stage 7
+v1's answers for faithfulness/groundedness and is excluded by default since it spends real money —
+run it explicitly with `-m costly`. Plain `pytest` covers `tests/` + Phase A only:
 
 ```bash
 docker compose up -d db backend   # only these two services are needed
-docker compose exec backend pytest -v
+docker compose exec backend pytest -v          # tests/ + evals/ Phase A — free, ~5s
+docker compose exec backend pytest -m costly -v  # evals/ Phase B — real LLM cost, needs
+                                                  # EVAL_JUDGE_MODEL set (see evals/judge.py)
 ```
+
+CI runs the free suite automatically on every push/PR (`.github/workflows/backend-tests.yml`);
+Phase B runs on a nightly schedule + manual dispatch (`evals-nightly.yml`) once a judge API key and
+`EVAL_JUDGE_MODEL` are configured as repo secrets/variables.
 
 Building it surfaced one real, previously-undocumented gap: comparing two named customers
 ("compare Acme Corp and Globex") used to silently answer about only the first — the same failure

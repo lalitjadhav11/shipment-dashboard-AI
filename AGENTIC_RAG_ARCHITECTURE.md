@@ -1712,3 +1712,127 @@ threshold picked without live verification has caused repeatedly elsewhere in th
 Same lesson as the rest of this document, aimed at a different kind of mistake: verifying *before*
 building is exactly as important as verifying *after* — the fix for a roadmap item that turns out
 to be premature is measuring that plainly, not implementing it anyway because it was on the list.
+
+## 25. Eval architecture — closing the gap `tests/` deliberately left open
+
+Every regression test in `backend/tests/` (§1's Phase 1 addition) is, by design, LLM-free:
+`conftest.py`'s `_no_live_llm_calls` fixture strips the API keys so the whole 197-test suite runs
+offline in a few seconds and asserts **routing** decisions — which template/gate fires — never what
+a real LLM actually drafts or writes. That was the right call for a free, always-on suite, but it
+left a real gap: nothing in this project systematically checked whether Stage 4b's LLM-drafted SQL
+is semantically correct, or whether Stage 7 v1's synthesized answers are actually *faithful* to the
+row data — the exact hallucination failure class documented across §14/§16/§20. Until now the only
+check was this document's own methodology: type a query, eyeball the answer, write down what broke.
+Valuable, but not repeatable and not regression-gated.
+
+**Design, confirmed before building**: staged, mirroring this project's own v0→v1 precedent (§2) —
+ship a zero-cost layer first, prove it, add the costed layer as a clearly separate phase. New
+`backend/evals/` directory, deliberately separate from `tests/` even though both use pytest and the
+same trace-assertion mechanism: `tests/` pins one regression test to one historic bug/commit and
+lives next to the code it protects; `evals/` is a curated, *growing* product-quality baseline —
+realistic scenarios collected on purpose, including ones a future Phase C could promote from real
+low-confidence production interactions (`shipment_chat_log.confidence_score`, already flagged by
+the schema's own governance note as needing a review queue that doesn't exist yet).
+
+`backend/tests/conftest.py` was promoted to `backend/conftest.py` so its fixtures (`consume_until()`,
+the schema warm-up, the DB-free entity caches) apply to both `tests/` and `evals/` without
+duplication. `pytest.ini` gained `eval`/`costly` markers and `testpaths = tests evals`, with
+`addopts = -m "not costly"` — so plain `pytest` still means "fast and free," now covering 204 cases
+instead of 197, and `pytest -m costly` is the explicit, separate opt-in for the layer that spends
+real money.
+
+### 25.1 Phase A — trajectory evals (ships first, zero LLM cost)
+
+`evals/golden/trajectory_cases.py` + `evals/test_trajectory.py`: a data-driven growth of exactly
+what `tests/test_intent_and_routing.py`/`test_compare_shipments.py` already do by hand — parametrize
+`consume_until()` over a golden list instead of one bespoke function per case. Seven cases at launch,
+one per major routing gate this document has already found and fixed: the causal gate (§15/§15.1),
+the wrong-grouping gate (§9's origin story), the list-vs-aggregate gate (§18), the history gate
+(§22), both branches of Phase 3's multi-shipment comparison (causal → Stage 7v1, plain → the free
+deterministic formatter), and a template-fast-path negative control. Two cases (`comparison_causal`,
+`comparison_plain_stays_deterministic`) needed canned `executor.execute_query()` rows via a
+`db_rows` field on the case dataclass — comparison's causal/non-causal branch decision only becomes
+visible *after* Stage 6 fires, unlike every other gate here, which is decided before Stage 6 ever
+runs. Verified live: 204 passed (197 existing + 7 new), a few seconds, zero LLM cost, confirmed via
+`pytest -m eval --collect-only` that the marker split is exact.
+
+### 25.2 Phase B — faithfulness evals (LLM-judge, real cost, opt-in)
+
+`evals/golden/faithfulness_cases.py` + `evals/test_faithfulness.py` + `evals/judge.py` +
+`evals/report.py`: three cases, each a direct regression guard for a hallucination this document
+already found live — §14 Bug 3's "no concept of now" (row data with one issue genuinely >7 days old
+and one that isn't; the answer must name the old one and never claim "no reference date"),
+`synthesize.py`'s own `_filter_context()` docstring bug (a WHERE-filtered query whose SELECT list
+doesn't repeat the filter column must not be read as "no customer name info exists"), and §20's false
+"historical timeline is not present" denial (a 6-stage `journey_timeline` fixture, matching the real
+`v_shipment_journey_summary` view's `stage`/`location`/`event_timestamp` shape). Each case calls
+`synthesize.synthesize()` **directly** with fixed row data — bypassing Stages 1-6 entirely — so the
+check isolates Stage 7 v1 specifically, decoupled from live data drift and from whether Stage 4b's
+SQL draft happens to query the right table (a separate, already-fixed concern).
+
+Two tiers of check per case, deliberately not equal weight: `must_include_facts`/`must_not_claim`
+(plain substring checks against the historically-observed hallucination wording) are hard-gating;
+`FaithfulnessMetric`'s continuous groundedness score (via `deepeval==4.1.8`) is logged only, not
+gated — no baseline exists yet to set a real threshold from, the same "don't guess a number" rule
+§24 already applied to `scoping_ms`. The substring checks are known to be narrower than the metric:
+they catch the *exact* phrasing already seen live, not a future paraphrase of the same false claim —
+that gap is exactly what the (currently informational) continuous score exists to eventually close
+once it has a baseline.
+
+`evals/judge.py`'s `HouseJudgeModel(DeepEvalBaseLLM)` wraps `llm_client.call_tool()` rather than
+opening a second LLM-calling path — it inherits the existing circuit breaker and provider
+abstraction for free, at the cost of relaying every judge prompt through a single generic `respond`
+tool-call (`call_tool()` only speaks structured tool-use, DeepEval's metrics expect plain,
+often-JSON-shaped text back). `EVAL_JUDGE_MODEL`/`EVAL_JUDGE_PROVIDER` are separate env vars from
+production's `AGENT_LLM_MODEL`/`AGENT_LLM_PROVIDER` — deliberately no default judge model is
+guessed; an unset `EVAL_JUDGE_MODEL` fails loudly at construction instead of silently shipping a
+model ID never verified against a real account. Verified live against `claude-sonnet-5` as judge
+(production on `claude-haiku-4-5-20251001`): all three cases passed, `FaithfulnessMetric` scored
+1.00 on each, real report written to `evals/runs/<timestamp>.json`.
+
+**Two real bugs surfaced during that live verification**, both fixed same-session:
+
+1. **`_no_live_llm_calls` silently broke the exact thing Phase B exists to do.** It was
+   session-scoped and unconditionally popped the API keys — written back when *every* test in the
+   suite was meant to be LLM-free. Once `evals/` existed, this stripped Phase B's keys too: both the
+   judge *and* the production-side answer under test degraded to the graceful-decline path, and the
+   first live run failed with "answer is missing expected facts" for a reason that had nothing to do
+   with the fixtures. Fixed by making the fixture function-scoped and skipping
+   `@pytest.mark.costly` tests (`request.node.get_closest_marker("costly")`) — confirmed after the
+   fix that the default suite is still exactly 204/zero-cost, and that a live `-m costly` run now
+   actually reaches the provider.
+2. **Judge and production-under-test calls shared one circuit-breaker bucket.** `llm_client.py`'s
+   breaker keys purely on provider name; with `EVAL_JUDGE_PROVIDER` unset (judge riding the same
+   provider as production, just a stronger model — the common case), three consecutive judge-side
+   failures would fail-fast the *production* call in the same test run too, and vice versa —
+   observed live as a confusing three-case failure that traced back to an unrelated judge-model
+   hiccup, not a real regression. Fixed by adding a `circuit_key` param to `call_tool()`, decoupled
+   from `provider` (defaults to it when omitted, so every existing production caller is unaffected),
+   with `judge.py` passing its own `eval-judge:<provider>` key. Same "verify live, not just in
+   theory" standard as everywhere else in this document — the bug only became visible by actually
+   running Phase B against a real account, not by reading the code.
+
+### 25.3 CI
+
+Neither the 197-test suite nor anything else in this project ran automatically before this —
+`.github/workflows/` didn't exist. `.github/workflows/backend-tests.yml` now runs the full free
+suite (`tests/` + Phase A) on every push/PR — no Postgres service container needed, confirmed the
+suite's own DB-free design (§1's Phase 1 addition) already guarantees that. `evals-nightly.yml` runs
+Phase B on a schedule + manual dispatch only, needs `ANTHROPIC_API_KEY`/`GEMINI_API_KEY` as repo
+secrets and `EVAL_JUDGE_MODEL` (`EVAL_JUDGE_PROVIDER` optional) as repo variables before it can
+actually pass, and uploads `evals/runs/*.json` as a workflow artifact. Both pin `actions/checkout`,
+`actions/setup-python`, `actions/cache`, `actions/upload-artifact` at their current major versions
+(verified live against each action's own release history, not assumed) — `pytest` itself was bumped
+`8.3.3` → `9.1.1` in the same pass, verified against the full suite plus `deepeval`'s own bundled
+plugins (`pytest-asyncio`/`pytest-xdist`/`pytest-repeat`/`pytest-rerunfailures`) before committing to
+it, since a pin this project depends on this broadly deserves the same verification discipline as
+everything else here, not a blind bump.
+
+**Deliberately not built in this pass** (documented, not scheduled): a `v_chat_needs_review` view
+promoting real low-confidence production interactions into the golden set (Phase C — the natural
+extension of the online/offline evaluation pairing the current eval-architecture research
+converges on), and adversarial/red-team evals via Promptfoo targeting the exact classes of gap this
+document's own bug history found by hand (`shipment_chat_log` exposure, the org_name/tracking_id
+multi-entity gaps) — Phase D. Every real vulnerability found in this project so far was found by one
+person trying one clever phrasing, not systematic fuzzing; closing that gap with actual tooling
+remains future work, not yet built.
