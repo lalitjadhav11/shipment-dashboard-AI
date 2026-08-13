@@ -45,22 +45,31 @@ def _warm_schema_state():
     schema_loader.warm_up()
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _no_live_llm_calls():
+@pytest.fixture(autouse=True)
+def _no_live_llm_calls(request, monkeypatch):
     """Regression tests assert ROUTING decisions (which template/gate fires),
     not what a real LLM drafts — Stage 4b/7v1 output is non-deterministic and
     costs real money/quota (see AGENTIC_RAG_ARCHITECTURE.md's provider notes),
-    so it's deliberately out of scope for this suite. Forcing the anthropic
-    provider with no API key makes llm_client.call_tool() return None
-    instantly (a plain env-var check, no network call) — so any test that
-    exercises the full pipeline for a query that SHOULD fall through to
-    Stage 4b still runs fast and deterministically; it just observes the
-    graceful-degradation path (the clarifying answer) instead of live LLM
-    output, which is exactly what "no provider configured" is supposed to do.
+    so it's deliberately out of scope for tests/ and evals/ Phase A. Popping
+    the API keys makes llm_client.call_tool() return None instantly (a plain
+    env-var check, no network call) — so any test that exercises the full
+    pipeline for a query that SHOULD fall through to Stage 4b still runs fast
+    and deterministically; it just observes the graceful-degradation path
+    (the clarifying answer) instead of live LLM output, which is exactly what
+    "no provider configured" is supposed to do.
+
+    Function-scoped (not session-scoped) specifically so @pytest.mark.costly
+    tests can opt out: evals/test_faithfulness.py's whole point is making
+    real LLM calls (both the production-side answer under test AND the
+    judge), and it's excluded from the default `pytest` run for exactly that
+    reason (see pytest.ini's addopts) — stripping its keys too would make it
+    silently degrade into the same graceful-decline path this fixture exists
+    to force for everything else, not a real evaluation.
     """
-    import os
+    if request.node.get_closest_marker("costly"):
+        return
     for var in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "AGENT_LLM_PROVIDER"):
-        os.environ.pop(var, None)
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture(autouse=True)

@@ -220,4 +220,8 @@ __marimo__/
 # Node / frontend
 node_modules/
 frontend/dist/
+
+# Phase B eval run reports (evals/report.py) — local/CI output, not source;
+# CI uploads these as a workflow artifact instead (see evals-nightly.yml).
+backend/evals/runs/
 frontend/node_modules/

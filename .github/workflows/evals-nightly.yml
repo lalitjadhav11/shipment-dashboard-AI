@@ -1,0 +1,56 @@
+name: evals-nightly
+
+# Phase B faithfulness evals — real LLM cost (both the production-side answer
+# under test and the judge scoring it spend a real call), so this runs on its
+# own schedule/manual trigger only, never on every push — see backend-tests.yml
+# for the free Phase A suite that runs on every push/PR instead.
+#
+# Repo configuration needed before this can actually pass:
+#   Secrets:   ANTHROPIC_API_KEY (or whichever provider AGENT_LLM_PROVIDER needs)
+#   Variables: EVAL_JUDGE_MODEL (required — see backend/evals/judge.py's module
+#              docstring), EVAL_JUDGE_PROVIDER (optional, defaults to the same
+#              provider as production)
+on:
+  schedule:
+    - cron: "0 6 * * *"  # 06:00 UTC nightly
+  workflow_dispatch: {}
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      EVAL_JUDGE_MODEL: ${{ vars.EVAL_JUDGE_MODEL }}
+      EVAL_JUDGE_PROVIDER: ${{ vars.EVAL_JUDGE_PROVIDER }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Cache sentence-transformers model
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-all-MiniLM-L6-v2-${{ hashFiles('backend/requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run Phase B faithfulness evals
+        run: pytest -m costly -q
+
+      - name: Upload eval run report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eval-runs
+          path: backend/evals/runs/*.json
+          if-no-files-found: warn

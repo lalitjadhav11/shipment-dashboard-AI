@@ -293,51 +293,70 @@ def _call_ollama(system_prompt: str, user_message: str, tool_name: str, tool_sch
 
 # --- Dispatch ----------------------------------------------------------
 
-def active_model_info(model_override: str | None = None) -> tuple:
+def active_model_info(model_override: str | None = None, provider_override: str | None = None) -> tuple:
     """(provider, model) for whichever provider call_tool() would currently
     dispatch to — used only for audit logging (shipment_chat_log's
-    llm_provider/llm_model columns), never for making the actual call. Kept
-    here rather than in pipeline.py so the provider->model-constant mapping
-    has one definition, not two that could drift apart. `model_override`
-    reports the actual model a specific call used (e.g. pipeline.py's
-    escalation retry passing ESCALATION_MODEL) instead of the module
-    default, when one was given."""
-    if PROVIDER == "ollama":
+    llm_provider/llm_model columns) and evals/report.py's run metadata, never
+    for making the actual call. Kept here rather than in pipeline.py so the
+    provider->model-constant mapping has one definition, not two that could
+    drift apart. `model_override` reports the actual model a specific call
+    used (e.g. pipeline.py's escalation retry passing ESCALATION_MODEL, or
+    evals/judge.py's EVAL_JUDGE_MODEL) instead of the module default, when
+    one was given; `provider_override` does the same for provider (evals/judge.py only)."""
+    provider = (provider_override or PROVIDER).lower()
+    if provider == "ollama":
         return "ollama", model_override or OLLAMA_MODEL
-    if PROVIDER == "gemini":
+    if provider == "gemini":
         return "gemini", model_override or GEMINI_MODEL
     return "anthropic", model_override or ANTHROPIC_MODEL
 
 
 def call_tool(*, system_prompt: str, user_message: str, tool_name: str, tool_schema: dict,
-              model_override: str | None = None) -> dict | None:
+              model_override: str | None = None, provider_override: str | None = None,
+              circuit_key: str | None = None) -> dict | None:
     """Forces the model to respond via exactly one tool call and returns its
     validated `input`/`arguments` dict, or None if the LLM is
     unavailable/unusable for this call (never raises). Provider is chosen by
     AGENT_LLM_PROVIDER — callers don't need to know or care which is active.
     `model_override` lets one call use a different model than the module
     default (see sql_llm.py's guardrail-rejection retry / ESCALATION_MODEL).
+    `provider_override` goes one step further and picks a different PROVIDER
+    for one call — added for evals/judge.py, which needs the judge to be able
+    to run on a genuinely independent provider (not just a different model on
+    the same one) without a second, parallel LLM-calling path; every
+    production caller (sql_llm.py, synthesize.py, pipeline.py's escalation
+    retry) omits it and gets the exact prior behavior.
 
     Wrapped in the per-provider circuit breaker: if this provider has failed
     CIRCUIT_FAILURE_THRESHOLD times in a row, this returns None immediately
-    without attempting the call at all, until CIRCUIT_COOLDOWN_SECONDS pass."""
-    if _circuit_is_open(PROVIDER):
-        print(f"[chat] circuit breaker open for provider={PROVIDER!r} "
+    without attempting the call at all, until CIRCUIT_COOLDOWN_SECONDS pass.
+    `circuit_key` decouples the breaker's bookkeeping from `provider` itself
+    (defaults to `provider` when omitted) — evals/judge.py sets this to a
+    judge-specific key so a struggling judge model can never trip (or read)
+    the same breaker bucket a production call on the same literal provider
+    would use; without this, an EVAL_JUDGE_PROVIDER left unset (judge riding
+    the same provider as production, just a stronger model) would let judge
+    failures fail-fast the production-side call under test in the same
+    process, and vice versa — a confusing false signal in either direction."""
+    provider = (provider_override or PROVIDER).lower()
+    breaker_key = circuit_key or provider
+    if _circuit_is_open(breaker_key):
+        print(f"[chat] circuit breaker open for provider={provider!r} (key={breaker_key!r}) "
               f"(>= {CIRCUIT_FAILURE_THRESHOLD} consecutive failures) — "
               f"failing fast instead of attempting another call", file=sys.stderr)
         return None
 
-    if PROVIDER == "ollama":
+    if provider == "ollama":
         result = _call_ollama(system_prompt, user_message, tool_name, tool_schema, model_override)
-    elif PROVIDER == "gemini":
+    elif provider == "gemini":
         result = _call_gemini(system_prompt, user_message, tool_name, tool_schema, model_override)
     else:
-        if PROVIDER != "anthropic":
-            print(f"[chat] unknown AGENT_LLM_PROVIDER={PROVIDER!r}, defaulting to anthropic", file=sys.stderr)
+        if provider != "anthropic":
+            print(f"[chat] unknown provider={provider!r}, defaulting to anthropic", file=sys.stderr)
         result = _call_anthropic(system_prompt, user_message, tool_name, tool_schema, model_override)
 
     if result is None:
-        _record_failure(PROVIDER)
+        _record_failure(breaker_key)
     else:
-        _record_success(PROVIDER)
+        _record_success(breaker_key)
     return result

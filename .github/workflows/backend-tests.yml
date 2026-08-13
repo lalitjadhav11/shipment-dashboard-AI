@@ -19,17 +19,17 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Cache sentence-transformers model
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: huggingface-all-MiniLM-L6-v2
+          key: huggingface-all-MiniLM-L6-v2-${{ hashFiles('backend/requirements.txt') }}
 
       - name: Install dependencies
         run: |

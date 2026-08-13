@@ -2,4 +2,8 @@
 # Kept in a separate file (installed in its own Docker layer, see Dockerfile)
 # so adding/upgrading a test tool never invalidates the slow, torch-downloading
 # production dependency layer built from requirements.txt.
-pytest==8.3.3
+pytest==9.1.1
+
+# --- Phase B evals (backend/evals/) — LLM-judge faithfulness scoring only,
+# never imported by tests/ or the app itself. See evals/judge.py.
+deepeval==4.1.8
