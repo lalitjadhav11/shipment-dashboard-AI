@@ -4,6 +4,7 @@ import { titleCase, formatLocation, formatTimestamp } from "../format.js";
 import StatusBadge from "./StatusBadge.jsx";
 import JourneyMap from "./JourneyMap.jsx";
 import { CloseIcon, PinIcon, SparkleIcon } from "./icons.jsx";
+import FormattedAnswer from "./FormattedAnswer.jsx";
 
 function Field({ label, children }) {
   return (
@@ -230,7 +231,7 @@ export default function ShipmentDetailDrawer({ trackingId, autoAiSummary, onClos
 
                       {!turn.loading && !turn.error && turn.answer && (
                         <>
-                          <p className="drawer-ai-summary__text">{turn.answer.answer}</p>
+                          <FormattedAnswer text={turn.answer.answer} className="drawer-ai-summary__text" />
                           {(() => {
                             // Turn 0 (the detailed summary) comes from a plain
                             // data endpoint with no suggestions of its own —

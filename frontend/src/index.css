@@ -341,7 +341,103 @@ select {
   font-size: 15px;
   line-height: 1.5;
   color: var(--text-primary);
-  white-space: pre-line;
+}
+
+/* Markdown children rendered by FormattedAnswer.jsx — shared by the main
+   chat panel's .ai-chat__answer and the drawer's .drawer-ai-summary__text,
+   which only differ in the font-size/color already set on the wrapper
+   above (inherited by everything below). Models reach for bold text, lists,
+   and inline code on their own even though nothing prompts them to; this is
+   what makes that render as actual emphasis instead of literal asterisks. */
+.ai-chat__answer p,
+.drawer-ai-summary__text p {
+  margin: 0 0 8px;
+}
+.ai-chat__answer p:last-child,
+.drawer-ai-summary__text p:last-child {
+  margin-bottom: 0;
+}
+.ai-chat__answer strong,
+.drawer-ai-summary__text strong {
+  font-weight: 700;
+}
+.ai-chat__answer ul,
+.ai-chat__answer ol,
+.drawer-ai-summary__text ul,
+.drawer-ai-summary__text ol {
+  margin: 4px 0 8px;
+  padding-left: 20px;
+}
+.ai-chat__answer ul:last-child,
+.ai-chat__answer ol:last-child,
+.drawer-ai-summary__text ul:last-child,
+.drawer-ai-summary__text ol:last-child {
+  margin-bottom: 0;
+}
+.ai-chat__answer li,
+.drawer-ai-summary__text li {
+  margin-bottom: 3px;
+}
+.ai-chat__answer li:last-child,
+.drawer-ai-summary__text li:last-child {
+  margin-bottom: 0;
+}
+.ai-chat__answer code,
+.drawer-ai-summary__text code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.9em;
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.ai-chat__answer pre,
+.drawer-ai-summary__text pre {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.ai-chat__answer pre code,
+.drawer-ai-summary__text pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+.ai-chat__answer a,
+.drawer-ai-summary__text a {
+  color: var(--text-link);
+  text-decoration: underline;
+}
+.ai-chat__answer blockquote,
+.drawer-ai-summary__text blockquote {
+  margin: 0 0 8px;
+  padding-left: 10px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-secondary);
+}
+.ai-chat__answer table,
+.drawer-ai-summary__text table {
+  border-collapse: collapse;
+  margin: 4px 0 8px;
+  font-size: 0.92em;
+  display: block;
+  overflow-x: auto;
+}
+.ai-chat__answer th,
+.ai-chat__answer td,
+.drawer-ai-summary__text th,
+.drawer-ai-summary__text td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+.ai-chat__answer th,
+.drawer-ai-summary__text th {
+  background: var(--surface-hover);
+  font-weight: 700;
 }
 
 .ai-chat__meta {
@@ -932,7 +1028,6 @@ select {
   font-size: 13.5px;
   line-height: 1.5;
   color: var(--text-primary);
-  white-space: pre-line;
 }
 
 .drawer-ai-summary__loading {

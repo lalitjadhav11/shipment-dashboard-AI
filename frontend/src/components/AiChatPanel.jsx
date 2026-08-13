@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { askAgent } from "../agentApi.js";
 import { SparkleIcon } from "./icons.jsx";
+import FormattedAnswer from "./FormattedAnswer.jsx";
 
 // Self-contained: owns the composer input AND the conversation history, so
 // the "AI Shipment Assistant" card only exists once there's something to
@@ -106,7 +107,7 @@ export default function AiChatPanel() {
                     <SparkleIcon width={13} height={13} />
                   </span>
                   <div className="ai-chat__answer-block">
-                    <p className="ai-chat__answer">{turn.answer.answer}</p>
+                    <FormattedAnswer text={turn.answer.answer} className="ai-chat__answer" />
 
                     {(turn.answer.tracking_id || turn.answer.current_status) && (
                       <div className="ai-chat__meta">
